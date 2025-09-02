@@ -3,6 +3,7 @@ import { Client, Collection, GatewayIntentBits, REST, Routes, Events } from 'dis
 import { env } from './lib/config';
 import * as ping from './commands/ping';
 import * as focus from './commands/focus';
+import * as profile from './commands/profile';
 import './lib/db';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -11,11 +12,12 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const commands = new Collection<string, any>([
   [ping.data.name, ping],
   [focus.data.name, focus],
+  [profile.data.name, profile],
 ]);
 
 async function registerSlashCommands() {
   const rest = new REST({ version: '10' }).setToken(env.DISCORD_TOKEN);
-  const body = [ping.data, focus.data].map(c => c.toJSON());
+  const body = [ping.data, focus.data, profile.data].map(c => c.toJSON());
   await rest.put(
     Routes.applicationGuildCommands(env.APPLICATION_ID, env.GUILD_ID),
     { body }
