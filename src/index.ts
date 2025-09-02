@@ -1,19 +1,21 @@
-// Point d’entrée du bot.
-// TODO: créer le client Discord, enregistrer les slash-commands, router vers /ping /focus /profile.
+// src/index.ts
 import { Client, Collection, GatewayIntentBits, REST, Routes, Events } from 'discord.js';
 import { env } from './lib/config';
 import * as ping from './commands/ping';
-import './lib/db'; // side-effect: crée les tables si absentes
-
+import * as focus from './commands/focus';
+import './lib/db';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // registre des commandes
-const commands = new Collection<string, any>([[ping.data.name, ping]]);
+const commands = new Collection<string, any>([
+  [ping.data.name, ping],
+  [focus.data.name, focus],
+]);
 
 async function registerSlashCommands() {
   const rest = new REST({ version: '10' }).setToken(env.DISCORD_TOKEN);
-  const body = [ping.data.toJSON()];
+  const body = [ping.data, focus.data].map(c => c.toJSON());
   await rest.put(
     Routes.applicationGuildCommands(env.APPLICATION_ID, env.GUILD_ID),
     { body }
