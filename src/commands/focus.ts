@@ -1,4 +1,3 @@
-// src/commands/focus.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
@@ -7,8 +6,12 @@ import {
   ButtonStyle,
   ActionRowBuilder,
   ComponentType,
+  MessageFlags,
 } from 'discord.js';
-import { commitSession } from '../lib/db';
+import { commitSession, sql } from '../lib/db';
+import { houses } from '../lib/houses';
+import { houseNameFromRoleId, introLine, victoryLine, failLine } from '../lib/rp';
+import { rollLoot, poolForHouseRoleId } from '../lib/loot';
 
 export const data = new SlashCommandBuilder()
   .setName('focus')
@@ -17,6 +20,7 @@ export const data = new SlashCommandBuilder()
     o.setName('minutes')
       .setDescription('Durée de la session')
       .setChoices(
+        { name: '1',  value: 1  },   // test rapide
         { name: '15', value: 15 },
         { name: '25', value: 25 },
         { name: '30', value: 30 },
@@ -37,14 +41,13 @@ export const data = new SlashCommandBuilder()
   );
 
 type TimerInfo = {
-  timeout: NodeJS.Timeout;
   startTs: number;
   minutes: number;
   skill: string;
   sujet: string | null;
+  houseRoleId?: string | null;
 };
 
-// Un seul timer par utilisateur (évite les doublons)
 const timers = new Map<string, TimerInfo>();
 
 export async function execute(interaction: ChatInputCommandInteraction) {
@@ -53,63 +56,62 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const sujet = interaction.options.getString('sujet');
   const userId = interaction.user.id;
 
-  // Si l’utilisateur a déjà une session en cours, on annule l’ancienne
-  const existing = timers.get(userId);
-  if (existing) {
-    clearTimeout(existing.timeout);
-    timers.delete(userId);
+  // Annule une éventuelle session précédente
+  timers.delete(userId);
+
+  // Guilde active
+  let houseRoleId: string | null = null;
+  if (interaction.inGuild()) {
+    try {
+      const member = await interaction.guild!.members.fetch(userId);
+      const current = houses.find(h => member.roles.cache.has(h.roleId));
+      houseRoleId = current?.roleId ?? null;
+    } catch { /* ignore */ }
   }
+  const houseName = houseNameFromRoleId(houseRoleId);
 
   const startTs = Math.floor(Date.now() / 1000);
   const endTs = startTs + minutes * 60;
 
   const embed = new EmbedBuilder()
     .setTitle('🎯 Session de focus')
-    .setDescription([
-      `**${minutes} min** sur **${skill}**`,
-      sujet ? `*${sujet}*` : null,
-      '',
-      `Fin prévue : <t:${endTs}:t>`,
-    ].filter(Boolean).join('\n'))
+    .setDescription(
+      [
+        introLine(houseName, minutes, skill), // RP intro ✨
+        sujet ? `*${sujet}*` : null,
+        '',
+        `Fin prévue : <t:${endTs}:t>`,
+      ].filter(Boolean).join('\n')
+    )
     .setColor(0x4caf50);
 
   const validateBtn = new ButtonBuilder()
     .setCustomId('focus-validate')
     .setLabel('Valider')
-    .setStyle(ButtonStyle.Success)
-    .setDisabled(true); // désactivé jusqu’à la fin
+    .setStyle(ButtonStyle.Success);
 
   const abortBtn = new ButtonBuilder()
     .setCustomId('focus-abort')
     .setLabel('Interrompu')
-    .setStyle(ButtonStyle.Danger)
-    .setDisabled(true); // désactivé jusqu’à la fin
+    .setStyle(ButtonStyle.Danger);
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(validateBtn, abortBtn);
 
-  // Message initial (éphémère = visible uniquement par toi)
   const msg = await interaction.reply({
     embeds: [embed],
     components: [row],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
     fetchReply: true,
   });
 
-  // À la fin de la session, activer les boutons
-  const timeout = setTimeout(async () => {
-    validateBtn.setDisabled(false);
-    abortBtn.setDisabled(false);
-    try {
-      await interaction.editReply({ components: [row] });
-    } catch (e) {
-      // si le message n'est plus éditable, on ignore
-      console.error('editReply failed after timer:', e);
-    }
-  }, minutes * 60 * 1000);
+  timers.set(userId, {
+    startTs,
+    minutes,
+    skill,
+    sujet: sujet ?? null,
+    houseRoleId,
+  });
 
-  timers.set(userId, { timeout, startTs, minutes, skill, sujet: sujet ?? null });
-
-  // Collector pour capter le clic sur les boutons (on laisse 10 min après la fin)
   const collector = msg.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: (minutes + 10) * 60 * 1000,
@@ -117,59 +119,70 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   collector.on('collect', async (btn) => {
     if (btn.user.id !== userId) {
-      return btn.reply({ content: 'Seul l’initiateur peut valider/interrompre cette session.', ephemeral: true });
+      return btn.reply({
+        content: 'Seul l’initiateur peut valider/interrompre cette session.',
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
-    // Récup info (si la Map a été vidée, on sécurise avec les options actuelles)
-    const info = timers.get(userId) ?? { startTs, minutes, skill, sujet: sujet ?? null, timeout } as TimerInfo;
+    const info = timers.get(userId);
+    if (!info) {
+      return btn.reply({ content: 'Session expirée ou introuvable.', flags: MessageFlags.Ephemeral });
+    }
 
-    // Valider = on enregistre la session "done" + XP = minutes
+    const now = Math.floor(Date.now() / 1000);
+    const finished = now >= info.startTs + info.minutes * 60;
+
     if (btn.customId === 'focus-validate') {
-      try {
-        commitSession(userId, info.startTs, info.minutes, 'done', info.skill, info.sujet);
-        await btn.update({
-          content: `✅ ${info.minutes} min validées sur **${info.skill}**. +${info.minutes} XP`,
-          embeds: [],
-          components: [],
-        });
-      } catch (e) {
-        console.error(e);
-        await btn.update({ content: '❌ Erreur lors de la validation, réessaie.', components: [], embeds: [] });
-      } finally {
-        clearTimeout(info.timeout);
-        timers.delete(userId);
-        collector.stop();
+      if (!finished) {
+        const remaining = (info.startTs + info.minutes * 60) - now;
+        const min = Math.floor(remaining / 60);
+        const sec = remaining % 60;
+        return btn.reply({ content: `⏳ Pas encore fini. Il reste **${min}m ${sec}s**.`, flags: MessageFlags.Ephemeral });
       }
+
+      // 1) XP = minutes
+      commitSession(userId, info.startTs, info.minutes, 'done', info.skill, info.sujet, info.houseRoleId);
+
+      // 2) Or : ~1 pièce par 25 min + petit bonus aléatoire si ≥15 min
+      let gold = Math.floor(info.minutes / 25);
+      if (info.minutes >= 15 && Math.random() < 0.15) gold += 1;
+      if (gold > 0) sql.addGold.run(gold, userId);
+
+      // 3) Loot aléatoire (tag guilde)
+      const drop = rollLoot(info.houseRoleId);
+      if (drop) {
+        const ts = Math.floor(Date.now() / 1000);
+        sql.insertLoot.run(userId, drop.key, info.houseRoleId ?? null, drop.rarity, ts);
+      }
+      const lootStr = drop ? `${drop.emoji ?? ''} ${drop.name} (${drop.rarity})` : undefined;
+
+      await btn.update({
+        content: victoryLine(houseName, info.minutes, info.minutes, gold, lootStr),
+        embeds: [],
+        components: [],
+      });
+
+      timers.delete(userId);
+      collector.stop();
       return;
     }
 
-    // Interrompu = on loggue la session "aborted" (0 minute, pas d’XP)
     if (btn.customId === 'focus-abort') {
-      try {
-        commitSession(userId, info.startTs, 0, 'aborted', info.skill, info.sujet);
-        await btn.update({
-          content: '❌ Session interrompue (aucune XP créditée)',
-          embeds: [],
-          components: [],
-        });
-      } catch (e) {
-        console.error(e);
-        await btn.update({ content: '❌ Erreur lors de l’enregistrement.', components: [], embeds: [] });
-      } finally {
-        clearTimeout(info.timeout);
-        timers.delete(userId);
-        collector.stop();
-      }
+      // XP partielle en cas d’abandon ? Ici: 0 XP (MVP)
+      commitSession(userId, info.startTs, 0, 'aborted', info.skill, info.sujet, info.houseRoleId);
+      await btn.update({
+        content: failLine(houseName, 0),
+        embeds: [],
+        components: [],
+      });
+      timers.delete(userId);
+      collector.stop();
       return;
     }
   });
 
   collector.on('end', () => {
-    // sécurité : si rien n’a été cliqué, on nettoie le timer
-    const info = timers.get(userId);
-    if (info) {
-      clearTimeout(info.timeout);
-      timers.delete(userId);
-    }
+    timers.delete(userId);
   });
 }

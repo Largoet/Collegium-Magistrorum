@@ -4,46 +4,77 @@ import fs from 'fs';
 import path from 'path';
 import { env } from './config';
 
-// 1) s'assurer que le dossier data existe
+// 1) dossier data
 const dir = path.dirname(env.DB_FILE);
 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-// 2) ouvrir la base + réglages safe
+// 2) ouvrir la base + réglages
 export const db = new Database(env.DB_FILE);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
-db.pragma('busy_timeout = 5000'); // évite SQLITE_BUSY quand il y a un peu de concurrence
+db.pragma('busy_timeout = 5000'); // éviter SQLITE_BUSY
 
-// 3) schéma minimal (MVP)
+// 3) schéma de base
 db.exec(`
 CREATE TABLE IF NOT EXISTS users(
   discord_id TEXT PRIMARY KEY,
-  prefs_json TEXT DEFAULT '{}'
+  prefs_json TEXT DEFAULT '{}',
+  gold INTEGER NOT NULL DEFAULT 0          -- ➕ or
 );
 CREATE TABLE IF NOT EXISTS sessions(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id TEXT NOT NULL,
-  started_at INTEGER NOT NULL,          -- timestamp (s)
+  started_at INTEGER NOT NULL,          -- ts (s)
   duration_min INTEGER NOT NULL,
   status TEXT CHECK(status IN ('done','aborted')) NOT NULL,
   skill TEXT,
   subject TEXT,
+  house_role_id TEXT,                   -- ➕ tag guilde
   FOREIGN KEY(user_id) REFERENCES users(discord_id)
 );
 CREATE TABLE IF NOT EXISTS xp_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id TEXT NOT NULL,
   delta_xp INTEGER NOT NULL,
-  at_ts INTEGER NOT NULL                 -- timestamp (s)
+  at_ts INTEGER NOT NULL,               -- ts (s)
+  house_role_id TEXT                    -- ➕ tag guilde
 );
 `);
 
-// 3bis) index utiles (perf /profile et historique)
+// 3bis) migrations légères
+function hasColumn(table: string, col: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some(r => r.name === col);
+}
+if (!hasColumn('sessions', 'house_role_id')) {
+  db.exec(`ALTER TABLE sessions ADD COLUMN house_role_id TEXT`);
+}
+if (!hasColumn('xp_log', 'house_role_id')) {
+  db.exec(`ALTER TABLE xp_log ADD COLUMN house_role_id TEXT`);
+}
+if (!hasColumn('users', 'gold')) {
+  db.exec(`ALTER TABLE users ADD COLUMN gold INTEGER NOT NULL DEFAULT 0`);
+}
+
+// 3ter) table loot (inventaire)
 db.exec(`
-CREATE INDEX IF NOT EXISTS idx_xp_user_ts
-  ON xp_log(user_id, at_ts);
-CREATE INDEX IF NOT EXISTS idx_sessions_user_start
-  ON sessions(user_id, started_at);
+CREATE TABLE IF NOT EXISTS loot(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  item_key TEXT NOT NULL,
+  house_role_id TEXT,
+  rarity TEXT NOT NULL,            -- 'common' | 'rare' | 'epic'
+  obtained_at INTEGER NOT NULL     -- ts (s)
+);
+`);
+
+// 3quater) index utiles
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_xp_user_ts           ON xp_log(user_id, at_ts);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_start  ON sessions(user_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_xp_house_ts          ON xp_log(house_role_id, at_ts);
+CREATE INDEX IF NOT EXISTS idx_sessions_house_start ON sessions(house_role_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_loot_user_ts         ON loot(user_id, obtained_at DESC);
 `);
 
 // 4) requêtes
@@ -54,9 +85,16 @@ export const sql = {
     INSERT INTO sessions(user_id, started_at, duration_min, status, skill, subject)
     VALUES (?,?,?,?,?,?)
   `),
+  insertSessionWithHouse: db.prepare(`
+    INSERT INTO sessions(user_id, started_at, duration_min, status, skill, subject, house_role_id)
+    VALUES (?,?,?,?,?,?,?)
+  `),
 
   insertXP: db.prepare(`
     INSERT INTO xp_log(user_id, delta_xp, at_ts) VALUES (?,?,?)
+  `),
+  insertXPWithHouse: db.prepare(`
+    INSERT INTO xp_log(user_id, delta_xp, at_ts, house_role_id) VALUES (?,?,?,?)
   `),
 
   totalXP30d: db.prepare(`
@@ -64,7 +102,11 @@ export const sql = {
     FROM xp_log
     WHERE user_id = ? AND at_ts >= strftime('%s','now','-30 days')
   `),
-
+  totalXPAll: db.prepare(`
+    SELECT COALESCE(SUM(delta_xp),0) AS xp
+    FROM xp_log
+    WHERE user_id = ?
+  `),
   totalSessions30d: db.prepare(`
     SELECT COUNT(*) AS n
     FROM sessions
@@ -72,7 +114,6 @@ export const sql = {
       AND status = 'done'
       AND started_at >= strftime('%s','now','-30 days')
   `),
-
   topSkills30d: db.prepare(`
     SELECT skill, SUM(duration_min) AS minutes
     FROM sessions
@@ -84,23 +125,63 @@ export const sql = {
     ORDER BY minutes DESC
     LIMIT 3
   `),
+  xpByHouse30d: db.prepare(`
+    SELECT house_role_id AS house, COALESCE(SUM(delta_xp),0) AS xp
+    FROM xp_log
+    WHERE user_id = ?
+      AND house_role_id IS NOT NULL
+      AND at_ts >= strftime('%s','now','-30 days')
+    GROUP BY house_role_id
+  `),
+  xpByHouseAll: db.prepare(`
+    SELECT house_role_id AS house, COALESCE(SUM(delta_xp),0) AS xp
+    FROM xp_log
+    WHERE user_id = ?
+      AND house_role_id IS NOT NULL
+    GROUP BY house_role_id
+  `),
+
+  // Or & loot
+  getGold: db.prepare(`
+    SELECT COALESCE(gold,0) AS gold FROM users WHERE discord_id = ?
+  `),
+  addGold: db.prepare(`
+    UPDATE users SET gold = COALESCE(gold,0) + ? WHERE discord_id = ?
+  `),
+  insertLoot: db.prepare(`
+    INSERT INTO loot(user_id, item_key, house_role_id, rarity, obtained_at) VALUES (?,?,?,?,?)
+  `),
+  recentLoot: db.prepare(`
+    SELECT item_key, rarity, house_role_id, obtained_at
+    FROM loot WHERE user_id = ? ORDER BY obtained_at DESC LIMIT 10
+  `),
 };
 
-
-// 5) transaction atomique pour valider une session
+// 5) transaction session
 export type SessionStatus = 'done' | 'aborted';
-
 export const commitSession = db.transaction((
   userId: string,
   startedAtSec: number,
   durationMin: number,
   status: SessionStatus,
   skill: string | null,
-  subject: string | null
+  subject: string | null,
+  houseRoleId?: string | null
 ) => {
   sql.upsertUser.run(userId);
-  sql.insertSession.run(userId, startedAtSec, durationMin, status, skill, subject);
+
+  if (houseRoleId) {
+    sql.insertSessionWithHouse.run(userId, startedAtSec, durationMin, status, skill, subject, houseRoleId);
+  } else {
+    sql.insertSession.run(userId, startedAtSec, durationMin, status, skill, subject);
+  }
+
   if (status === 'done') {
-    sql.insertXP.run(userId, durationMin, Math.floor(Date.now() / 1000));
+    const now = Math.floor(Date.now() / 1000);
+    if (houseRoleId) {
+      sql.insertXPWithHouse.run(userId, durationMin, now, houseRoleId);
+    } else {
+      sql.insertXP.run(userId, durationMin, now);
+    }
   }
 });
