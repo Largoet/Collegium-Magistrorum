@@ -145,6 +145,11 @@ export const sql = {
   getGold: db.prepare(`
     SELECT COALESCE(gold,0) AS gold FROM users WHERE discord_id = ?
   `),
+  spendGold: db.prepare(`                      -- ➕ ADDED: débit d'or conditionnel
+    UPDATE users
+    SET gold = COALESCE(gold, 0) - ?
+    WHERE discord_id = ? AND COALESCE(gold, 0) >= ?
+  `),
   addGold: db.prepare(`
     UPDATE users SET gold = COALESCE(gold,0) + ? WHERE discord_id = ?
   `),
@@ -184,4 +189,26 @@ export const commitSession = db.transaction((
       sql.insertXP.run(userId, durationMin, now);
     }
   }
+});
+
+// ➕ ADDED: transaction d'achat d'XP avec débit d'or atomique
+export const purchaseXPBoost = db.transaction((
+  userId: string,
+  xp: number,
+  price: number,
+  houseRoleId?: string | null
+): boolean => {
+  sql.upsertUser.run(userId);
+
+  // Tente de débiter; si pas assez d’or, aucune modification (changes = 0)
+  const res = sql.spendGold.run(price, userId, price);
+  if (res.changes !== 1) return false;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (houseRoleId) {
+    sql.insertXPWithHouse.run(userId, xp, now, houseRoleId);
+  } else {
+    sql.insertXP.run(userId, xp, now);
+  }
+  return true;
 });
