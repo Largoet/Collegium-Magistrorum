@@ -1,3 +1,4 @@
+// src/commands/focus.ts
 import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
@@ -11,7 +12,7 @@ import {
 import { commitSession, sql } from '../lib/db';
 import { houses } from '../lib/houses';
 import { houseNameFromRoleId, introLine, victoryLine, failLine } from '../lib/rp';
-import { rollLoot, poolForHouseRoleId } from '../lib/loot';
+import { rollLoot } from '../lib/loot';
 
 export const data = new SlashCommandBuilder()
   .setName('focus')
@@ -46,6 +47,7 @@ type TimerInfo = {
   skill: string;
   sujet: string | null;
   houseRoleId?: string | null;
+  notifyTimeout?: NodeJS.Timeout;
 };
 
 const timers = new Map<string, TimerInfo>();
@@ -104,14 +106,41 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     fetchReply: true,
   });
 
+  // ⏰ Notification de fin (DM, sinon fallback salon)
+  const notifyTimeout = setTimeout(async () => {
+    const pretty = `⏰ Focus terminé (${minutes} min) sur **${skill}**.`;
+
+    // 1) DM
+    try {
+      await interaction.user.send(
+        `${pretty}\nClique **Valider** ou **Interrompre** sur le message du bot.\n` +
+        `Fin : <t:${endTs}:R> (il y a peu).`
+      );
+      return;
+    } catch {
+      // 2) Fallback salon
+      if (interaction.inGuild() && interaction.channel) {
+        try {
+          await interaction.channel.send({
+            content: `⏰ <@${userId}> ${pretty} Clique **Valider** sur le message du bot.`,
+            allowedMentions: { users: [userId] },
+          });
+        } catch { /* ignore */ }
+      }
+    }
+  }, minutes * 60 * 1000);
+
+  // Mémorise la session
   timers.set(userId, {
     startTs,
     minutes,
     skill,
     sujet: sujet ?? null,
     houseRoleId,
+    notifyTimeout,
   });
 
+  // Collector pour clics (durée: session + 10 min)
   const collector = msg.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: (minutes + 10) * 60 * 1000,
@@ -141,10 +170,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         return btn.reply({ content: `⏳ Pas encore fini. Il reste **${min}m ${sec}s**.`, flags: MessageFlags.Ephemeral });
       }
 
+      if (info.notifyTimeout) clearTimeout(info.notifyTimeout);
+
       // 1) XP = minutes
       commitSession(userId, info.startTs, info.minutes, 'done', info.skill, info.sujet, info.houseRoleId);
 
-      // 2) Or : ~1 pièce par 25 min + petit bonus aléatoire si ≥15 min
+      // 2) Or : ~1 pièce / 25 min + petit bonus si ≥15 min
       let gold = Math.floor(info.minutes / 25);
       if (info.minutes >= 15 && Math.random() < 0.15) gold += 1;
       if (gold > 0) sql.addGold.run(gold, userId);
@@ -169,13 +200,17 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     }
 
     if (btn.customId === 'focus-abort') {
-      // XP partielle en cas d’abandon ? Ici: 0 XP (MVP)
+      if (info.notifyTimeout) clearTimeout(info.notifyTimeout);
+
+      // Ici: 0 XP en cas d’abandon (MVP)
       commitSession(userId, info.startTs, 0, 'aborted', info.skill, info.sujet, info.houseRoleId);
+
       await btn.update({
         content: failLine(houseName, 0),
         embeds: [],
         components: [],
       });
+
       timers.delete(userId);
       collector.stop();
       return;
@@ -183,6 +218,8 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   });
 
   collector.on('end', () => {
+    const infoEnd = timers.get(userId);
+    if (infoEnd?.notifyTimeout) clearTimeout(infoEnd.notifyTimeout);
     timers.delete(userId);
   });
 }
