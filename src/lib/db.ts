@@ -46,22 +46,46 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_start
   ON sessions(user_id, started_at);
 `);
 
-// 4) requêtes prêtes à l'emploi
+// 4) requêtes
 export const sql = {
   upsertUser: db.prepare(`INSERT OR IGNORE INTO users(discord_id) VALUES (?)`),
+
   insertSession: db.prepare(`
     INSERT INTO sessions(user_id, started_at, duration_min, status, skill, subject)
     VALUES (?,?,?,?,?,?)
   `),
+
   insertXP: db.prepare(`
     INSERT INTO xp_log(user_id, delta_xp, at_ts) VALUES (?,?,?)
   `),
+
   totalXP30d: db.prepare(`
     SELECT COALESCE(SUM(delta_xp),0) AS xp
     FROM xp_log
     WHERE user_id = ? AND at_ts >= strftime('%s','now','-30 days')
   `),
+
+  totalSessions30d: db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM sessions
+    WHERE user_id = ?
+      AND status = 'done'
+      AND started_at >= strftime('%s','now','-30 days')
+  `),
+
+  topSkills30d: db.prepare(`
+    SELECT skill, SUM(duration_min) AS minutes
+    FROM sessions
+    WHERE user_id = ?
+      AND status = 'done'
+      AND skill IS NOT NULL
+      AND started_at >= strftime('%s','now','-30 days')
+    GROUP BY skill
+    ORDER BY minutes DESC
+    LIMIT 3
+  `),
 };
+
 
 // 5) transaction atomique pour valider une session
 export type SessionStatus = 'done' | 'aborted';
