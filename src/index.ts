@@ -9,6 +9,7 @@ import * as ping from './commands/ping';
 import * as focus from './commands/focus';
 import * as profile from './commands/profile';
 import * as housesPanel from './commands/houses-panel';
+import * as inventory from './commands/inventory';
 import { houses } from './lib/houses';
 import './lib/db';
 
@@ -23,6 +24,7 @@ const commands = new Collection<string, any>([
   [focus.data.name, focus],
   [profile.data.name, profile],
   [housesPanel.data.name, housesPanel],
+  [inventory.data.name, inventory],
 ]);
 
 async function registerSlashCommands() {
