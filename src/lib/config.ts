@@ -8,7 +8,11 @@ const Env = z.object({
   DISCORD_TOKEN: z.string().min(1, 'DISCORD_TOKEN manquant'),
   APPLICATION_ID: z.string().min(1, 'APPLICATION_ID manquant'),
   GUILD_ID: z.string().min(1, 'GUILD_ID manquant'),
-  DB_FILE: z.string().default('./data/bot.db')
+  DB_FILE: z.string().default('./data/bot.db'),
+  WELCOME_CHANNEL_ID: z.string().optional(),
+  HOUSE_ROLES: z.string().optional(),
+
+
 });
 
 export const env = Env.parse(process.env);
