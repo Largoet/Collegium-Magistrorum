@@ -12,214 +12,192 @@ import {
 import { commitSession, sql } from '../lib/db';
 import { houses } from '../lib/houses';
 import { houseNameFromRoleId, introLine, victoryLine, failLine } from '../lib/rp';
-import { rollLoot } from '../lib/loot';
+import { rollLootForUser } from '../lib/loot';
+
+// Empêche plusieurs sessions /focus simultanées par utilisateur (slash)
+const running = new Map<string, { startedAtSec: number; enableAtSec: number; minutes: number; skill: string; subject: string; houseRoleId: string | null }>();
 
 export const data = new SlashCommandBuilder()
   .setName('focus')
-  .setDescription('Démarrer une session de focus (type Pomodoro)')
+  .setDescription('Lancer une session de focus (avec validation ou interruption)')
   .addIntegerOption(o =>
     o.setName('minutes')
-      .setDescription('Durée de la session')
-      .setChoices(
-        { name: '1',  value: 1  },   // test rapide
+      .setDescription('Durée (ex. 25)')
+      .setRequired(true)
+      .addChoices(
         { name: '15', value: 15 },
         { name: '25', value: 25 },
-        { name: '30', value: 30 },
         { name: '45', value: 45 },
         { name: '60', value: 60 },
       )
-      .setRequired(true)
   )
   .addStringOption(o =>
-    o.setName('skill')
-      .setDescription('Compétence/discipline travaillée (ex: Linux, Maths, Docker)')
-      .setRequired(true)
+    o.setName('competence')
+      .setDescription('Compétence (ex. Lecture, Docker)')
+      .setRequired(false)
   )
   .addStringOption(o =>
     o.setName('sujet')
-      .setDescription('Sujet ou objectif (optionnel)')
+      .setDescription('Sujet / note (optionnel)')
       .setRequired(false)
   );
 
-type TimerInfo = {
-  startTs: number;
-  minutes: number;
-  skill: string;
-  sujet: string | null;
-  houseRoleId?: string | null;
-  notifyTimeout?: NodeJS.Timeout;
-};
-
-const timers = new Map<string, TimerInfo>();
-
 export async function execute(interaction: ChatInputCommandInteraction) {
-  const minutes = interaction.options.getInteger('minutes', true);
-  const skill = interaction.options.getString('skill', true);
-  const sujet = interaction.options.getString('sujet');
   const userId = interaction.user.id;
 
-  // Annule une éventuelle session précédente
-  timers.delete(userId);
+  if (running.has(userId)) {
+    return interaction.reply({
+      content: '⏳ Tu as déjà une session /focus en cours. Valide ou interrompt-la d’abord.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 
-  // Guilde active
+  const minutes = interaction.options.getInteger('minutes', true);
+  const skill = (interaction.options.getString('competence') || 'Général').trim();
+  const subject = (interaction.options.getString('sujet') || '').trim();
+
+  const startedAtSec = Math.floor(Date.now() / 1000);
+  const enableAtSec = startedAtSec + minutes * 60;
+
+  // guilde actuelle (si en serveur)
   let houseRoleId: string | null = null;
   if (interaction.inGuild()) {
-    try {
-      const member = await interaction.guild!.members.fetch(userId);
-      const current = houses.find(h => member.roles.cache.has(h.roleId));
-      houseRoleId = current?.roleId ?? null;
-    } catch { /* ignore */ }
+    const member = interaction.guild!.members.cache.get(userId);
+    const h = houses.find(hh => member?.roles.cache.has(hh.roleId));
+    houseRoleId = h?.roleId ?? null;
   }
-  const houseName = houseNameFromRoleId(houseRoleId);
+  const houseName = houseNameFromRoleId(houseRoleId ?? undefined);
 
-  const startTs = Math.floor(Date.now() / 1000);
-  const endTs = startTs + minutes * 60;
+  running.set(userId, { startedAtSec, enableAtSec, minutes, skill, subject, houseRoleId });
 
+  const endInlineTs = `<t:${enableAtSec}:t>`; // heure locale rendue par Discord
+
+  // message initial
   const embed = new EmbedBuilder()
-    .setTitle('🎯 Session de focus')
-    .setDescription(
-      [
-        introLine(houseName, minutes, skill), // RP intro ✨
-        sujet ? `*${sujet}*` : null,
-        '',
-        `Fin prévue : <t:${endTs}:t>`,
-      ].filter(Boolean).join('\n')
-    )
-    .setColor(0x4caf50);
+    .setTitle(`Focus — ${houseName}`)
+    .setDescription(`${introLine(houseName, minutes, skill)}\n\n**Fin prévue :** ${endInlineTs}`)
+    .setColor(0x1976d2)
+    .setTimestamp(new Date(enableAtSec * 1000));
 
-  const validateBtn = new ButtonBuilder()
-    .setCustomId('focus-validate')
-    .setLabel('Valider')
-    .setStyle(ButtonStyle.Success);
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId('slash:focus:validate').setLabel('Valider').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('slash:focus:interrupt').setLabel('Interrompre').setStyle(ButtonStyle.Danger),
+  );
 
-  const abortBtn = new ButtonBuilder()
-    .setCustomId('focus-abort')
-    .setLabel('Interrompu')
-    .setStyle(ButtonStyle.Danger);
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(validateBtn, abortBtn);
-
-  const msg = await interaction.reply({
+  await interaction.reply({
     embeds: [embed],
     components: [row],
     flags: MessageFlags.Ephemeral,
-    fetchReply: true,
   });
 
-  // ⏰ Notification de fin (DM, sinon fallback salon)
-  const notifyTimeout = setTimeout(async () => {
-    const pretty = `⏰ Focus terminé (${minutes} min) sur **${skill}**.`;
-
-    // 1) DM
-    try {
-      await interaction.user.send(
-        `${pretty}\nClique **Valider** ou **Interrompre** sur le message du bot.\n` +
-        `Fin : <t:${endTs}:R> (il y a peu).`
-      );
-      return;
-    } catch {
-      // 2) Fallback salon
-      if (interaction.inGuild() && interaction.channel) {
-        try {
-          await interaction.channel.send({
-            content: `⏰ <@${userId}> ${pretty} Clique **Valider** sur le message du bot.`,
-            allowedMentions: { users: [userId] },
-          });
-        } catch { /* ignore */ }
-      }
-    }
-  }, minutes * 60 * 1000);
-
-  // Mémorise la session
-  timers.set(userId, {
-    startTs,
-    minutes,
-    skill,
-    sujet: sujet ?? null,
-    houseRoleId,
-    notifyTimeout,
-  });
-
-  // Collector pour clics (durée: session + 10 min)
+  // on attend les clics sur CE message, par CET utilisateur
+  const msg: any = await interaction.fetchReply();
   const collector = msg.createMessageComponentCollector({
     componentType: ComponentType.Button,
-    time: (minutes + 10) * 60 * 1000,
+    time: minutes * 60 * 1000 + 10 * 60 * 1000, // durée + 10 min de marge
+    filter: (btn: any) =>
+      btn.user.id === userId &&
+      (btn.customId === 'slash:focus:validate' || btn.customId === 'slash:focus:interrupt'),
   });
 
-  collector.on('collect', async (btn) => {
-    if (btn.user.id !== userId) {
-      return btn.reply({
-        content: 'Seul l’initiateur peut valider/interrompre cette session.',
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-
-    const info = timers.get(userId);
-    if (!info) {
-      return btn.reply({ content: 'Session expirée ou introuvable.', flags: MessageFlags.Ephemeral });
+  collector.on('collect', async (btn: any) => {
+    const r = running.get(userId);
+    if (!r) {
+      try {
+        await btn.reply({ content: 'Aucune session en cours.', flags: MessageFlags.Ephemeral });
+      } catch {}
+      return;
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const finished = now >= info.startTs + info.minutes * 60;
 
-    if (btn.customId === 'focus-validate') {
-      if (!finished) {
-        const remaining = (info.startTs + info.minutes * 60) - now;
-        const min = Math.floor(remaining / 60);
-        const sec = remaining % 60;
-        return btn.reply({ content: `⏳ Pas encore fini. Il reste **${min}m ${sec}s**.`, flags: MessageFlags.Ephemeral });
+    if (btn.customId === 'slash:focus:validate') {
+      if (now < r.enableAtSec) {
+        const remaining = Math.max(0, r.enableAtSec - now);
+        const mins = Math.ceil(remaining / 60);
+        return btn.reply({ content: `⏳ Pas encore ! Il reste **${mins} min**.`, flags: MessageFlags.Ephemeral });
       }
 
-      if (info.notifyTimeout) clearTimeout(info.notifyTimeout);
+      // calculs fin
+      const elapsedMin = Math.max(1, Math.round((now - r.startedAtSec) / 60));
+      const xp = elapsedMin;
+      const gold = Math.floor(elapsedMin / 15);
 
-      // 1) XP = minutes
-      commitSession(userId, info.startTs, info.minutes, 'done', info.skill, info.sujet, info.houseRoleId);
-
-      // 2) Or : ~1 pièce / 25 min + petit bonus si ≥15 min
-      let gold = Math.floor(info.minutes / 25);
-      if (info.minutes >= 15 && Math.random() < 0.15) gold += 1;
+      // DB
+      commitSession(userId, r.startedAtSec, elapsedMin, 'done', r.skill || null, r.subject || null, r.houseRoleId || null);
+      const at = now;
+      if (r.houseRoleId) sql.insertXPWithHouse.run(userId, xp, at, r.houseRoleId);
+      else sql.insertXP.run(userId, xp, at);
       if (gold > 0) sql.addGold.run(gold, userId);
 
-      // 3) Loot aléatoire (tag guilde)
-      const drop = rollLoot(info.houseRoleId);
-      if (drop) {
-        const ts = Math.floor(Date.now() / 1000);
-        sql.insertLoot.run(userId, drop.key, info.houseRoleId ?? null, drop.rarity, ts);
+      // Loot (sans doublons)
+      const drop = rollLootForUser(userId, r.houseRoleId ?? undefined);
+      if (drop) sql.insertLoot.run(userId, drop.key, r.houseRoleId, drop.rarity, at);
+
+      const lootStr = drop ? `${drop.emoji ?? '🎁'} ${drop.name} (${drop.rarity})` : undefined;
+      const desc = victoryLine(houseNameFromRoleId(r.houseRoleId ?? undefined), elapsedMin, xp, gold, lootStr);
+
+      const doneEmbed = new EmbedBuilder().setTitle('Session validée ✅').setDescription(desc).setColor(0x2e7d32);
+
+      running.delete(userId);
+      collector.stop('validated');
+
+      try {
+        const disabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId('slash:focus:validate').setLabel('Valider').setStyle(ButtonStyle.Success).setDisabled(true),
+          new ButtonBuilder().setCustomId('slash:focus:interrupt').setLabel('Interrompre').setStyle(ButtonStyle.Danger).setDisabled(true),
+        );
+        await btn.update({ embeds: [doneEmbed], components: [disabled] });
+      } catch {
+        await btn.reply({ embeds: [doneEmbed], flags: MessageFlags.Ephemeral }).catch(() => {});
       }
-      const lootStr = drop ? `${drop.emoji ?? ''} ${drop.name} (${drop.rarity})` : undefined;
-
-      await btn.update({
-        content: victoryLine(houseName, info.minutes, info.minutes, gold, lootStr),
-        embeds: [],
-        components: [],
-      });
-
-      timers.delete(userId);
-      collector.stop();
       return;
     }
 
-    if (btn.customId === 'focus-abort') {
-      if (info.notifyTimeout) clearTimeout(info.notifyTimeout);
+    if (btn.customId === 'slash:focus:interrupt') {
+      const elapsedMin = Math.max(1, Math.round((now - r.startedAtSec) / 60));
+      const xp = Math.max(1, Math.floor(elapsedMin * 0.3));
 
-      // Ici: 0 XP en cas d’abandon (MVP)
-      commitSession(userId, info.startTs, 0, 'aborted', info.skill, info.sujet, info.houseRoleId);
+      commitSession(userId, r.startedAtSec, elapsedMin, 'aborted', r.skill || null, r.subject || null, r.houseRoleId || null);
+      const at = now;
+      if (r.houseRoleId) sql.insertXPWithHouse.run(userId, xp, at, r.houseRoleId);
+      else sql.insertXP.run(userId, xp, at);
 
-      await btn.update({
-        content: failLine(houseName, 0),
-        embeds: [],
-        components: [],
-      });
+      const failEmbed = new EmbedBuilder()
+        .setTitle('Session interrompue')
+        .setDescription(failLine(houseNameFromRoleId(r.houseRoleId ?? undefined), xp))
+        .setColor(0xc62828);
 
-      timers.delete(userId);
-      collector.stop();
+      running.delete(userId);
+      collector.stop('aborted');
+
+      try {
+        const disabled = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId('slash:focus:validate').setLabel('Valider').setStyle(ButtonStyle.Success).setDisabled(true),
+          new ButtonBuilder().setCustomId('slash:focus:interrupt').setLabel('Interrompre').setStyle(ButtonStyle.Danger).setDisabled(true),
+        );
+        await btn.update({ embeds: [failEmbed], components: [disabled] });
+      } catch {
+        await btn.reply({ embeds: [failEmbed], flags: MessageFlags.Ephemeral }).catch(() => {});
+      }
       return;
     }
   });
 
-  collector.on('end', () => {
-    const infoEnd = timers.get(userId);
-    if (infoEnd?.notifyTimeout) clearTimeout(infoEnd.notifyTimeout);
-    timers.delete(userId);
+  collector.on('end', async (_collected: any, reason: string) => {
+    // si la session est encore marquée, on laisse les boutons actifs (la validation contrôlera l’heure)
+    if (reason === 'time' && running.has(userId)) return;
   });
+
+  // ping de fin (optionnel) — notifie discrètement quand l’heure est atteinte
+  setTimeout(async () => {
+    const r = running.get(userId);
+    if (!r) return;
+    try {
+      await interaction.followUp({
+        content: `⏰ Session terminée pour <@${userId}> — clique **Valider** ou **Interrompre** sur le message précédent.`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch {}
+  }, minutes * 60 * 1000);
 }

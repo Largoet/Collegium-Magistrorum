@@ -1,28 +1,36 @@
-// Courbe de niveaux + barre de progression
+// src/lib/game.ts
 
-// Coût du prochain niveau (augmenté progressivement)
-export function xpForLevel(level: number): number {
-  return 100 + 50 * level; // L0->1:100, L1->2:150, L2->3:200, ...
-}
-
-// À partir d'un total d'XP, calcule niveau, progression vers le suivant, etc.
-export function levelFromXP(totalXP: number): {
-  level: number; into: number; toNext: number; pct: number;
+/** Courbe de niveaux : coût du prochain niveau = 100 + 50 * level */
+export function levelFromXP(xpTotal: number): {
+  level: number;
+  into: number;
+  toNext: number;
+  pct: number;
 } {
   let level = 0;
-  let rem = Math.max(0, Math.floor(totalXP));
-  while (rem >= xpForLevel(level)) {
-    rem -= xpForLevel(level);
-    level++;
+  let remaining = Math.max(0, Math.floor(xpTotal));
+  let cost = 100;
+
+  while (remaining >= cost) {
+    remaining -= cost;
+    level += 1;
+    cost = 100 + 50 * level;
   }
-  const toNext = xpForLevel(level);
-  const pct = toNext === 0 ? 1 : rem / toNext;
-  return { level, into: rem, toNext, pct };
+
+  const into = remaining;
+  const toNext = cost;
+  const pct = Math.max(0, Math.min(100, Math.round((into / toNext) * 100)));
+  return { level, into, toNext, pct };
 }
 
-// Barre de progression textuelle
-export function progressBar(pct: number, size = 16): string {
-  const clamped = Math.max(0, Math.min(1, pct));
-  const filled = Math.round(size * clamped);
-  return '▰'.repeat(filled) + '▱'.repeat(size - filled);
+export function progressBar(current: number, max: number, width = 18): string {
+  const safeMax = Math.max(1, Math.floor(max));
+  const ratio = Math.max(0, Math.min(1, current / safeMax));
+
+  const w = Math.max(4, Math.min(18, Math.floor(width)));
+
+  const filled = Math.round(ratio * w);
+  const empty = w - filled;
+
+  return '▰'.repeat(filled) + '▱'.repeat(empty);
 }

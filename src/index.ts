@@ -2,7 +2,7 @@
 import {
   Client, Collection, GatewayIntentBits, REST, Routes, Events,
   ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
-  EmbedBuilder, Interaction,
+  EmbedBuilder, MessageFlags, Interaction,
 } from 'discord.js';
 import { env } from './lib/config';
 
@@ -34,6 +34,7 @@ import {
   handleProfileOpen,
   handleLeaderboardRefresh,
   handleShopOpen,
+  handleShopBuy,
 } from './handlers/panelHandlers';
 
 import { houses } from './lib/houses';
@@ -160,13 +161,13 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
           .setColor(0x4caf50);
 
         await interaction.message.edit({ components: [] }).catch(() => {});
-        await interaction.followUp({ embeds: [done], ephemeral: true }).catch(() => {});
+        await interaction.followUp({ embeds: [done], flags: MessageFlags.Ephemeral }).catch(() => {});
       } catch (e: any) {
         console.error('House select error:', e);
         const tip = e?.code === 50013
           ? 'Permissions insuffisantes : donne **Gérer les rôles** au bot et place son rôle **au-dessus** des rôles de guilde.'
           : 'Erreur lors de l’attribution du rôle.';
-        await interaction.followUp({ content: `❌ ${tip}`, ephemeral: true }).catch(() => {});
+        await interaction.followUp({ content: `❌ ${tip}`, flags: MessageFlags.Ephemeral }).catch(() => {});
       }
       return;
     }
@@ -175,32 +176,41 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // Focus (panneau)
-      if (id.startsWith('panel:focus:')) return handleFocusButton(interaction);
-      if (id === 'panel:focus:validate') return handleFocusValidate(interaction);
-      if (id === 'panel:focus:interrupt') return handleFocusInterrupt(interaction);
+      // Focus
+      if (id === 'panel:focus:validate') return handleFocusValidate(interaction as any);
+      if (id === 'panel:focus:interrupt') return handleFocusInterrupt(interaction as any);
+      if (id.startsWith('panel:focus:')) return handleFocusButton(interaction as any);
 
-      // Daily (panneau)
-      if (id === 'panel:daily:claim') return handleDailyButton(interaction);
+      // Daily
+      if (id === 'panel:daily:claim') return handleDailyButton(interaction as any);
 
-      // (facultatif) autres panneaux si tu ajoutes leurs handlers :
-      if (id === 'panel:profile:open') return handleProfileOpen?.(interaction as any);
-      if (id === 'panel:leaderboard:refresh') return handleLeaderboardRefresh?.(interaction as any);
-      if (id === 'panel:shop:open') return handleShopOpen?.(interaction as any);
+      // Profile
+      if (id === 'panel:profile:open') return handleProfileOpen(interaction as any);
+
+      // Leaderboard
+      if (id === 'panel:leaderboard:refresh') return handleLeaderboardRefresh(interaction as any);
+
+      // Shop
+      if (id === 'panel:shop:open') return handleShopOpen(interaction as any);
+      if (id.startsWith('shop:buy:')) return handleShopBuy(interaction as any);
+
+      return;
     }
 
     // 3) Modals des panneaux
     if (interaction.isModalSubmit()) {
       if (interaction.customId === 'modal:focus:custom') {
-        return handleFocusModal(interaction);
+        return handleFocusModal(interaction as any);
       }
+      return;
     }
 
-    // 4) Slash-commands (fallback)
+    // 4) Slash-commands
     if (interaction.isChatInputCommand()) {
       const cmd = commands.get(interaction.commandName);
       if (!cmd) return;
       await cmd.execute(interaction);
+      return;
     }
 
   } catch (err) {
@@ -208,9 +218,9 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     if (interaction.isRepliable()) {
       const msg = 'Une erreur est survenue.';
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: msg, ephemeral: true }).catch(() => {});
+        await interaction.followUp({ content: msg, flags: MessageFlags.Ephemeral }).catch(() => {});
       } else {
-        await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+        await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral }).catch(() => {});
       }
     }
   }

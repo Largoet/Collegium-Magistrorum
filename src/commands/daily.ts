@@ -1,84 +1,76 @@
 // src/commands/daily.ts
-import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, MessageFlags } from 'discord.js';
-import { houses } from '../lib/houses';
+import {
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  EmbedBuilder,
+  MessageFlags,
+} from 'discord.js';
 import { sql } from '../lib/db';
-import { rollLoot } from '../lib/loot';
+import { houses } from '../lib/houses';
 import { houseNameFromRoleId } from '../lib/rp';
+import { rollLootForUser } from '../lib/loot';
 
-const CLAIM_COOLDOWN_SEC = 20 * 60 * 60; // 20h — plus souple que 24h
+const CLAIM_COOLDOWN_SEC = 20 * 60 * 60; // 20h
 
 export const data = new SlashCommandBuilder()
   .setName('daily')
-  .setDescription('Réclame ta récompense quotidienne (or, XP, chance de loot)');
+  .setDescription('Réclamer ta récompense quotidienne');
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const userId = interaction.user.id;
   const now = Math.floor(Date.now() / 1000);
 
-  // Détecter guilde active (pour loot et tag)
-  let houseRoleId: string | null = null;
-  if (interaction.inGuild()) {
-    try {
-      const member = await interaction.guild!.members.fetch(userId);
-      const current = houses.find(h => member.roles.cache.has(h.roleId));
-      houseRoleId = current?.roleId ?? null;
-    } catch { /* ignore */ }
-  }
-  const houseName = houseNameFromRoleId(houseRoleId);
+  // Streak + cooldown (même logique que le panneau)
+  const row = sql.getDaily.get(userId) as { last_claim_ts?: number; streak?: number } | undefined;
+  const last = row?.last_claim_ts ?? 0;
+  let streak = row?.streak ?? 0;
 
-  const d = sql.getDaily.get(userId) as { last_claim_ts: number; streak: number } | undefined;
-  const last = d?.last_claim_ts ?? 0;
-  const diff = now - last;
-
-  if (diff < CLAIM_COOLDOWN_SEC) {
-    const wait = CLAIM_COOLDOWN_SEC - diff;
-    const h = Math.floor(wait / 3600);
-    const m = Math.floor((wait % 3600) / 60);
+  const delta = now - last;
+  if (last && delta < CLAIM_COOLDOWN_SEC) {
+    const remain = CLAIM_COOLDOWN_SEC - delta;
+    const hrs = Math.floor(remain / 3600);
+    const mins = Math.ceil((remain % 3600) / 60);
     return interaction.reply({
-      content: `⏳ Tu pourras reclamer dans **${h}h ${m}m**.`,
+      content: `🕒 Trop tôt ! Reviens dans **${hrs}h ${mins}m**.`,
       flags: MessageFlags.Ephemeral,
     });
   }
 
-  // Streak: reset si > 48h, sinon +1
-  let streak = (d?.streak ?? 0);
-  if (last === 0 || diff > 48 * 3600) streak = 1; else streak += 1;
+  // Grâce : si >0 et < 48h depuis le dernier claim → streak+1 (cap à 7)
+  if (!last || delta < 48 * 3600) streak = Math.min((streak || 0) + 1, 7);
+  else streak = 1;
 
-  // Récompenses (simple et lisible)
-  const baseGold = 2;
-  const bonusGold = Math.min(streak, 7); // cap à +7
-  const totalGold = baseGold + bonusGold;
+  // Déterminer la guilde actuelle (si en serveur)
+  const member = interaction.inGuild() ? interaction.guild!.members.cache.get(userId) : null;
+  const houseRoleId = member ? houses.find(h => member.roles.cache.has(h.roleId))?.roleId ?? null : null;
+  const houseName = houseNameFromRoleId(houseRoleId ?? undefined);
 
-  const baseXP = 5;
-  const bonusXP = Math.floor(streak / 3) * 2; // +2 XP tous les 3 jours
-  const totalXP = baseXP + bonusXP;
+  // Récompense
+  const baseGold = 25;
+  const baseXP = 15;
+  const bonus = Math.round((streak - 1) * 0.2 * baseXP);
+  const totalXP = baseXP + bonus;
+  const totalGold = baseGold + Math.floor(streak / 2) * 5;
 
-  // Applique or + xp
+  // DB
   sql.upsertUser.run(userId);
   sql.addGold.run(totalGold, userId);
-  const ts = now;
-  if (houseRoleId) {
-    sql.insertXPWithHouse.run(userId, totalXP, ts, houseRoleId);
-  } else {
-    sql.insertXP.run(userId, totalXP, ts);
-  }
+  const at = now;
+  if (houseRoleId) sql.insertXPWithHouse.run(userId, totalXP, at, houseRoleId);
+  else sql.insertXP.run(userId, totalXP, at);
 
-  // Loot aléatoire (faible chance)
-  const drop = Math.random() < 0.25 ? rollLoot(houseRoleId) : null;
-  if (drop) {
-    sql.insertLoot.run(userId, drop.key, houseRoleId ?? null, drop.rarity, ts);
-  }
+  // Loot sans doublons
+  const drop = rollLootForUser(userId, houseRoleId ?? undefined);
+  if (drop) sql.insertLoot.run(userId, drop.key, houseRoleId, drop.rarity, at);
 
-  // Enregistre claim
+  // Streak update
   sql.upsertDaily.run(userId, now, streak);
 
-  const emoji = drop?.emoji ?? '🎁';
-  const lootLine = drop ? `\n${emoji} Butin: **${drop.name}** (${drop.rarity})` : '';
+  // Embed
+  const lootLine = drop ? `\n${drop.emoji ?? '🎁'} Butin: **${drop.name}** (${drop.rarity})` : '';
   const embed = new EmbedBuilder()
     .setTitle(`Récompense quotidienne — ${houseName}`)
-    .setDescription(
-      `Tu gagnes **${totalGold} 🪙** et **${totalXP} XP** (streak: ${streak}).${lootLine}`
-    )
+    .setDescription(`Tu gagnes **${totalGold} 🪙** et **${totalXP} XP** (streak: ${streak}).${lootLine}`)
     .setColor(0xff9800);
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });

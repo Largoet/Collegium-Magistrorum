@@ -1,3 +1,4 @@
+// src/handlers/panelHandlers.ts
 import {
   ButtonInteraction,
   ModalBuilder,
@@ -6,13 +7,14 @@ import {
   ActionRowBuilder,
   ModalSubmitInteraction,
   EmbedBuilder,
+  MessageFlags,
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
 import { houses } from '../lib/houses';
-import { commitSession, sql } from '../lib/db';
+import { commitSession, sql, buyShopOffer } from '../lib/db';
 import { houseNameFromRoleId, introLine, victoryLine, failLine } from '../lib/rp';
-import { rollLoot } from '../lib/loot';
+import { rollLootForUser } from '../lib/loot';
 
 /** Sessions en cours démarrées depuis un panneau */
 type Running = {
@@ -84,7 +86,7 @@ export async function handleFocusButton(i: ButtonInteraction) {
 
   const mins = Number(kind);
   if (!Number.isFinite(mins) || mins <= 0) {
-    return i.reply({ content: 'Durée invalide.', ephemeral: true });
+    return i.reply({ content: 'Durée invalide.', flags: MessageFlags.Ephemeral });
   }
   return startFocusFromPanel(i, mins, 'Général', '');
 }
@@ -96,7 +98,7 @@ export async function handleFocusModal(i: ModalSubmitInteraction) {
   const subject = (i.fields.getTextInputValue('focus:subject') || '').trim();
 
   if (!Number.isFinite(minutes) || minutes <= 0) {
-    return i.reply({ content: 'Durée invalide.', ephemeral: true });
+    return i.reply({ content: 'Durée invalide.', flags: MessageFlags.Ephemeral });
   }
   return startFocusFromPanel(i, minutes, skill, subject);
 }
@@ -115,17 +117,17 @@ async function startFocusFromPanel(
   const enableAtSec = startedAtSec + minutes * 60;
   timers.set(userId, { startedAtSec, minutes, skill, subject, houseRoleId, enableAtSec });
 
+  const endTag = `<t:${enableAtSec}:t>`;
   const embed = new EmbedBuilder()
     .setTitle(`Focus — ${houseName}`)
-    .setDescription(introLine(houseName, minutes, skill))
-    .setFooter({ text: `Fin estimée dans ${minutes} min` })
-    .setColor(0x1976d2);
+    .setDescription(`${introLine(houseName, minutes, skill)}\n\n**Fin prévue :** ${endTag}`)
+    .setColor(0x1976d2)
+    .setTimestamp(new Date(enableAtSec * 1000));
 
-  // 👉 NE PAS désactiver "Valider" : on laisse cliquer, et on bloque par logique temps (see handleFocusValidate)
   await i.reply({
     embeds: [embed],
     components: componentsForSession(false),
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -133,7 +135,7 @@ export async function handleFocusValidate(i: ButtonInteraction) {
   const userId = i.user.id;
   const r = timers.get(userId);
   if (!r) {
-    return i.reply({ content: 'Aucune session en cours.', ephemeral: true });
+    return i.reply({ content: 'Aucune session en cours.', flags: MessageFlags.Ephemeral });
   }
 
   const now = Math.floor(Date.now() / 1000);
@@ -141,24 +143,21 @@ export async function handleFocusValidate(i: ButtonInteraction) {
     const remaining = Math.max(0, r.enableAtSec - now);
     return i.reply({
       content: `⏳ Pas encore ! Il reste **${Math.ceil(remaining / 60)} min**.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
-  // Calculs
   const elapsedMin = Math.max(1, Math.round((now - r.startedAtSec) / 60));
   const xp = elapsedMin;
   const gold = Math.floor(elapsedMin / 15);
 
-  // DB
   commitSession(i.user.id, r.startedAtSec, elapsedMin, 'done', r.skill || null, r.subject || null, r.houseRoleId || null);
   const at = now;
   if (r.houseRoleId) sql.insertXPWithHouse.run(userId, xp, at, r.houseRoleId);
   else sql.insertXP.run(userId, xp, at);
   if (gold > 0) sql.addGold.run(gold, userId);
 
-  // Loot
-  const drop = rollLoot(r.houseRoleId ?? undefined);
+  const drop = rollLootForUser(userId, r.houseRoleId ?? undefined);
   if (drop) sql.insertLoot.run(userId, drop.key, r.houseRoleId, drop.rarity, at);
 
   const lootStr = drop ? `${drop.emoji ?? '🎁'} ${drop.name} (${drop.rarity})` : undefined;
@@ -168,19 +167,19 @@ export async function handleFocusValidate(i: ButtonInteraction) {
   const embed = new EmbedBuilder().setTitle('Session validée ✅').setDescription(desc).setColor(0x2e7d32);
 
   timers.delete(userId);
-  await i.reply({ embeds: [embed], ephemeral: true });
+  await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 export async function handleFocusInterrupt(i: ButtonInteraction) {
   const userId = i.user.id;
   const r = timers.get(userId);
   if (!r) {
-    return i.reply({ content: 'Aucune session en cours.', ephemeral: true });
+    return i.reply({ content: 'Aucune session en cours.', flags: MessageFlags.Ephemeral });
   }
 
   const now = Math.floor(Date.now() / 1000);
   const elapsedMin = Math.max(1, Math.round((now - r.startedAtSec) / 60));
-  const xp = Math.max(1, Math.floor(elapsedMin * 0.3)); // un peu d’XP même en fail
+  const xp = Math.max(1, Math.floor(elapsedMin * 0.3));
 
   commitSession(i.user.id, r.startedAtSec, elapsedMin, 'aborted', r.skill || null, r.subject || null, r.houseRoleId || null);
   const at = now;
@@ -191,7 +190,7 @@ export async function handleFocusInterrupt(i: ButtonInteraction) {
   const embed = new EmbedBuilder().setTitle('Session interrompue').setDescription(failLine(houseName, xp)).setColor(0xc62828);
 
   timers.delete(userId);
-  await i.reply({ embeds: [embed], ephemeral: true });
+  await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 // -------- Daily --------
@@ -202,7 +201,6 @@ export async function handleDailyButton(i: ButtonInteraction) {
   const userId = i.user.id;
   const now = Math.floor(Date.now() / 1000);
 
-  // Streak + cooldown (même logique que ta /daily)
   const row = sql.getDaily.get(userId) as { last_claim_ts?: number; streak?: number } | undefined;
   const last = row?.last_claim_ts ?? 0;
   let streak = row?.streak ?? 0;
@@ -214,14 +212,13 @@ export async function handleDailyButton(i: ButtonInteraction) {
     const mins = Math.ceil((remain % 3600) / 60);
     return i.reply({
       content: `🕒 Trop tôt ! Reviens dans **${hrs}h ${mins}m**.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   if (!last || delta < 48 * 3600) streak = Math.min((streak || 0) + 1, 7);
   else streak = 1;
 
-  // Récompense
   const member = i.inGuild() ? i.guild!.members.cache.get(userId) : null;
   const houseRoleId = member ? houses.find(h => member.roles.cache.has(h.roleId))?.roleId ?? null : null;
   const houseName = houseNameFromRoleId(houseRoleId ?? undefined);
@@ -232,14 +229,13 @@ export async function handleDailyButton(i: ButtonInteraction) {
   const totalXP = baseXP + bonus;
   const totalGold = baseGold + Math.floor(streak / 2) * 5;
 
-  // DB
   sql.upsertUser.run(userId);
   sql.addGold.run(totalGold, userId);
   const at = now;
   if (houseRoleId) sql.insertXPWithHouse.run(userId, totalXP, at, houseRoleId);
   else sql.insertXP.run(userId, totalXP, at);
 
-  const drop = rollLoot(houseRoleId ?? undefined);
+  const drop = rollLootForUser(userId, houseRoleId ?? undefined);
   if (drop) sql.insertLoot.run(userId, drop.key, houseRoleId, drop.rarity, at);
 
   sql.upsertDaily.run(userId, now, streak);
@@ -250,5 +246,45 @@ export async function handleDailyButton(i: ButtonInteraction) {
     .setDescription(`Tu gagnes **${totalGold} 🪙** et **${totalXP} XP** (streak: ${streak}).${lootLine}`)
     .setColor(0xff9800);
 
-  await i.reply({ embeds: [embed], ephemeral: true });
+  await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+// -------- Panneaux additionnels : Profile / Leaderboard / Shop --------
+
+import * as profileCmd from '../commands/profile';
+export async function handleProfileOpen(i: ButtonInteraction) {
+  return (profileCmd as any).execute(i as any);
+}
+
+import * as leaderboardCmd from '../commands/leaderboard';
+export async function handleLeaderboardRefresh(i: ButtonInteraction) {
+  return (leaderboardCmd as any).execute(i as any);
+}
+
+import * as shopCmd from '../commands/shop';
+export async function handleShopOpen(i: ButtonInteraction) {
+  return (shopCmd as any).execute(i as any);
+}
+
+/* -------- Achat depuis la boutique (bouton 'shop:buy:<id>') -------- */
+export async function handleShopBuy(i: ButtonInteraction) {
+  const m = /^shop:buy:(\d+)$/.exec(i.customId);
+  if (!m) return;
+  const offerId = Number(m[1]);
+
+  const res = buyShopOffer(i.user.id, offerId);
+  if (!res.ok) {
+    const reason =
+      res.reason === 'or insuffisant' ? 'or insuffisant' :
+      res.reason === 'offre introuvable' ? 'offre introuvable' :
+      res.reason === 'offre non liée à cet utilisateur' ? 'offre non liée' :
+      res.reason === 'déjà achetée' ? 'déjà achetée' :
+      'conflit';
+    return i.reply({ content: `❌ Achat impossible (${reason}).`, flags: MessageFlags.Ephemeral });
+  }
+
+  const goldRow = sql.getGold.get(i.user.id) as { gold?: number } | undefined;
+  const left = goldRow?.gold ?? 0;
+  await i.reply({ content: `✅ Achat effectué ! Or restant : **${left}** 🪙`, flags: MessageFlags.Ephemeral });
+
 }
