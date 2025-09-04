@@ -2,9 +2,11 @@
 import {
   Client, Collection, GatewayIntentBits, REST, Routes, Events,
   ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
-  EmbedBuilder, MessageFlags
+  EmbedBuilder, Interaction,
 } from 'discord.js';
 import { env } from './lib/config';
+
+// ---- Commands existants ----
 import * as ping from './commands/ping';
 import * as focus from './commands/focus';
 import * as profile from './commands/profile';
@@ -12,6 +14,28 @@ import * as housesPanel from './commands/houses-panel';
 import * as inventory from './commands/inventory';
 import * as shop from './commands/shop';
 import * as buy from './commands/buy';
+import * as daily from './commands/daily';
+import * as leaderboard from './commands/leaderboard';
+
+// ---- Nouveaux panneaux ----
+import * as focusPanel from './commands/focus-panel';
+import * as dailyPanel from './commands/daily-panel';
+import * as profilePanel from './commands/profile-panel';
+import * as leaderboardPanel from './commands/leaderboard-panel';
+import * as shopPanel from './commands/shop-panel';
+
+// ---- Handlers panneaux ----
+import {
+  handleFocusButton,
+  handleFocusModal,
+  handleFocusValidate,
+  handleFocusInterrupt,
+  handleDailyButton,
+  handleProfileOpen,
+  handleLeaderboardRefresh,
+  handleShopOpen,
+} from './handlers/panelHandlers';
+
 import { houses } from './lib/houses';
 import './lib/db';
 
@@ -27,8 +51,16 @@ const commands = new Collection<string, any>([
   [profile.data.name, profile],
   [housesPanel.data.name, housesPanel],
   [inventory.data.name, inventory],
+  [daily.data.name, daily],
+  [leaderboard.data.name, leaderboard],
   [shop.data.name, shop],
   [buy.data.name, buy],
+  // panneaux
+  [focusPanel.data.name, focusPanel],
+  [dailyPanel.data.name, dailyPanel],
+  [profilePanel.data.name, profilePanel],
+  [leaderboardPanel.data.name, leaderboardPanel],
+  [shopPanel.data.name, shopPanel],
 ]);
 
 async function registerSlashCommands() {
@@ -100,11 +132,10 @@ client.on(Events.GuildMemberAdd, async (member) => {
 });
 
 /* -------- Routage des interactions -------- */
-client.on(Events.InteractionCreate, async (interaction) => {
+client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   try {
-    // Sélection de guilde
+    // 1) Sélection de guilde
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('house:select:')) {
-      // acquitte tout de suite (évite "Échec de l’interaction")
       await interaction.deferUpdate();
 
       const roleId = interaction.values[0];
@@ -128,33 +159,58 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setDescription(`Tu as rejoint **${roleName}**.\nTes anciennes sessions/XP restent attribuées à tes anciens choix.`)
           .setColor(0x4caf50);
 
-        // Nettoie le menu + confirmation éphémérale
         await interaction.message.edit({ components: [] }).catch(() => {});
-        await interaction.followUp({ embeds: [done], flags: MessageFlags.Ephemeral }).catch(() => {});
+        await interaction.followUp({ embeds: [done], ephemeral: true }).catch(() => {});
       } catch (e: any) {
         console.error('House select error:', e);
         const tip = e?.code === 50013
           ? 'Permissions insuffisantes : donne **Gérer les rôles** au bot et place son rôle **au-dessus** des rôles de guilde.'
           : 'Erreur lors de l’attribution du rôle.';
-        await interaction.followUp({ content: `❌ ${tip}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+        await interaction.followUp({ content: `❌ ${tip}`, ephemeral: true }).catch(() => {});
       }
       return;
     }
 
-    // Slash-commands
-    if (!interaction.isChatInputCommand()) return;
-    const cmd = commands.get(interaction.commandName);
-    if (!cmd) return;
-    await cmd.execute(interaction);
+    // 2) Boutons des panneaux
+    if (interaction.isButton()) {
+      const id = interaction.customId;
+
+      // Focus (panneau)
+      if (id.startsWith('panel:focus:')) return handleFocusButton(interaction);
+      if (id === 'panel:focus:validate') return handleFocusValidate(interaction);
+      if (id === 'panel:focus:interrupt') return handleFocusInterrupt(interaction);
+
+      // Daily (panneau)
+      if (id === 'panel:daily:claim') return handleDailyButton(interaction);
+
+      // (facultatif) autres panneaux si tu ajoutes leurs handlers :
+      if (id === 'panel:profile:open') return handleProfileOpen?.(interaction as any);
+      if (id === 'panel:leaderboard:refresh') return handleLeaderboardRefresh?.(interaction as any);
+      if (id === 'panel:shop:open') return handleShopOpen?.(interaction as any);
+    }
+
+    // 3) Modals des panneaux
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === 'modal:focus:custom') {
+        return handleFocusModal(interaction);
+      }
+    }
+
+    // 4) Slash-commands (fallback)
+    if (interaction.isChatInputCommand()) {
+      const cmd = commands.get(interaction.commandName);
+      if (!cmd) return;
+      await cmd.execute(interaction);
+    }
 
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
       const msg = 'Une erreur est survenue.';
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: msg, flags: MessageFlags.Ephemeral }).catch(() => {});
+        await interaction.followUp({ content: msg, ephemeral: true }).catch(() => {});
       } else {
-        await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral }).catch(() => {});
+        await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
       }
     }
   }

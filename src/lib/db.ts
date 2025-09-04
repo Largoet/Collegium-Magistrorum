@@ -68,6 +68,16 @@ CREATE TABLE IF NOT EXISTS loot(
 );
 `);
 
+// ➕ ADDED: 3quinquies) table daily claims (récompense quotidienne)
+db.exec(`
+CREATE TABLE IF NOT EXISTS daily_claims(
+  user_id TEXT PRIMARY KEY,
+  last_claim_ts INTEGER NOT NULL,
+  streak INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(user_id) REFERENCES users(discord_id)
+);
+`);
+
 // 3quater) index utiles
 db.exec(`
 CREATE INDEX IF NOT EXISTS idx_xp_user_ts           ON xp_log(user_id, at_ts);
@@ -141,11 +151,21 @@ export const sql = {
     GROUP BY house_role_id
   `),
 
+  // ➕ ADDED: leaderboard (XP 30j)
+  topXP30d: db.prepare(`
+    SELECT user_id, COALESCE(SUM(delta_xp),0) AS xp
+    FROM xp_log
+    WHERE at_ts >= strftime('%s','now','-30 days')
+    GROUP BY user_id
+    ORDER BY xp DESC
+    LIMIT 10
+  `),
+
   // Or & loot
   getGold: db.prepare(`
     SELECT COALESCE(gold,0) AS gold FROM users WHERE discord_id = ?
   `),
-  spendGold: db.prepare(`                      -- ➕ ADDED: débit d'or conditionnel
+  spendGold: db.prepare(`                      -- débit d'or conditionnel
     UPDATE users
     SET gold = COALESCE(gold, 0) - ?
     WHERE discord_id = ? AND COALESCE(gold, 0) >= ?
@@ -159,6 +179,16 @@ export const sql = {
   recentLoot: db.prepare(`
     SELECT item_key, rarity, house_role_id, obtained_at
     FROM loot WHERE user_id = ? ORDER BY obtained_at DESC LIMIT 10
+  `),
+
+  // ➕ ADDED: daily
+  getDaily: db.prepare(`
+    SELECT last_claim_ts, streak FROM daily_claims WHERE user_id = ?
+  `),
+  upsertDaily: db.prepare(`
+    INSERT INTO daily_claims(user_id, last_claim_ts, streak)
+    VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET last_claim_ts = excluded.last_claim_ts, streak = excluded.streak
   `),
 };
 
