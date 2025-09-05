@@ -1,36 +1,55 @@
 // src/lib/game.ts
 
-/** Courbe de niveaux : coût du prochain niveau = 100 + 50 * level */
-export function levelFromXP(xpTotal: number): {
+// Courbe simple : coût du niveau N = BASE + STEP * N
+export const XP_BASE = 100;
+export const XP_STEP = 50;
+
+function needForLevel(level: number): number {
+  return XP_BASE + XP_STEP * level;
+}
+
+/**
+ * Calcule le niveau à partir de l'XP total.
+ * Renvoie :
+ *  - level  : niveau courant (0,1,2,…)
+ *  - into   : XP déjà investie dans le niveau courant
+ *  - toNext : XP nécessaire pour passer au niveau suivant
+ *  - pct    : into / toNext (0..1)
+ */
+export function levelFromXP(totalXP: number): {
   level: number;
   into: number;
   toNext: number;
   pct: number;
 } {
   let level = 0;
-  let remaining = Math.max(0, Math.floor(xpTotal));
-  let cost = 100;
+  let rem = Math.max(0, Math.floor(totalXP || 0));
 
-  while (remaining >= cost) {
-    remaining -= cost;
-    level += 1;
-    cost = 100 + 50 * level;
+  // on “consomme” l'XP palier par palier
+  while (rem >= needForLevel(level)) {
+    rem -= needForLevel(level);
+    level++;
   }
 
-  const into = remaining;
-  const toNext = cost;
-  const pct = Math.max(0, Math.min(100, Math.round((into / toNext) * 100)));
+  const into = rem;
+  const toNext = needForLevel(level);
+  const pct = toNext > 0 ? into / toNext : 1;
+
   return { level, into, toNext, pct };
 }
 
-export function progressBar(current: number, max: number, width = 18): string {
-  const safeMax = Math.max(1, Math.floor(max));
-  const ratio = Math.max(0, Math.min(1, current / safeMax));
-
-  const w = Math.max(4, Math.min(18, Math.floor(width)));
-
-  const filled = Math.round(ratio * w);
-  const empty = w - filled;
-
-  return '▰'.repeat(filled) + '▱'.repeat(empty);
+/**
+ * Barre de progression textuelle.
+ * ratio ∈ [0..1], slots = nombre de cases.
+ * Important : on fait floor APRÈS multiplication.
+ */
+export function progressBar(
+  ratio: number,
+  slots = 18,
+  fill = '■',
+  empty = '□'
+): string {
+  const r = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) : 0;
+  const filled = Math.floor(r * slots); // ✅ multiplier AVANT de floor
+  return fill.repeat(filled) + empty.repeat(slots - filled);
 }

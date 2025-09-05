@@ -7,114 +7,164 @@ import {
   APIEmbedField,
 } from 'discord.js';
 import { sql } from '../lib/db';
-import { levelFromXP, progressBar } from '../lib/game';
+import { levelFromXP } from '../lib/game';
 import { houses } from '../lib/houses';
-import { titleForGuildXP, GuildName } from '../lib/titles';
+import { titlesByGuild, GuildName } from '../lib/titles';
 import { collectionProgress, collectionBonuses } from '../lib/loot';
+import { themeByRoleId } from '../lib/theme';
 
 export const data = new SlashCommandBuilder()
   .setName('profile')
   .setDescription('Affiche ta fiche personnage (progression, guildes, compétences, collections)');
 
-function fmt(n: number) {
-  return n.toLocaleString('fr-FR');
+function fmt(n: number) { return n.toLocaleString('fr-FR'); }
+
+/* ---------- Barres esthétiques ---------- */
+
+type BarStyle = 'slider' | 'solid' | 'emoji';
+const PROFILE_BAR_STYLE: BarStyle = 'slider'; // 'slider' | 'solid' | 'emoji'
+
+function makeBar(current: number, max: number, slots = 22, style: BarStyle = PROFILE_BAR_STYLE) {
+  const ratio = max > 0 ? current / max : 0;
+  const r = Math.max(0, Math.min(1, ratio));
+
+  if (style === 'solid') {
+    const filled = Math.floor(r * slots);
+    return '█'.repeat(filled) + '░'.repeat(slots - filled);
+  }
+  if (style === 'emoji') {
+    const filled = Math.floor(r * slots);
+    return '🟩'.repeat(filled) + '⬛'.repeat(slots - filled);
+  }
+  // slider (piste + curseur)
+  const width = slots;
+  const pos = Math.min(width - 1, Math.round(r * (width - 1)));
+  let track = '';
+  for (let i = 0; i < width; i++) track += (i === pos ? '●' : '─');
+  return `【${track}】`;
 }
+
+function pct(current: number, max: number) {
+  const r = max > 0 ? Math.max(0, Math.min(1, current / max)) : 0;
+  return Math.round(r * 100);
+}
+
+/* ---------- Progression de guilde robuste ---------- */
+
+function computeGuildProgress(guild: GuildName, gXP: number) {
+  const ladder = titlesByGuild[guild] ?? []; // [{ name, xp }, ...] ordonné par xp croissante
+  if (ladder.length === 0) {
+    return { current: null as { name: string; xp: number } | null, next: undefined as { name: string; xp: number } | undefined, done: 0, span: 1, xpToNext: 0 };
+  }
+
+  // index du premier palier STRICTEMENT supérieur à gXP
+  const nextIndex = ladder.findIndex(t => t.xp > gXP);
+
+  // Cas 1 : en-dessous du 1er palier
+  if (nextIndex === 0) {
+    const current = null;
+    const next = ladder[0];
+    const currentMin = 0;
+    const target = next.xp;
+    const done = Math.max(0, gXP - currentMin);      // = gXP
+    const span = Math.max(1, target - currentMin);   // = next.xp
+    const xpToNext = Math.max(0, target - gXP);      // combien reste pour atteindre le 1er palier
+    return { current, next, done, span, xpToNext };
+  }
+
+  // Cas 2 : au-dessus du dernier palier (ou égal)
+  if (nextIndex === -1) {
+    const current = ladder[ladder.length - 1];
+    const next = undefined;
+    const currentMin = current.xp;
+    const target = Math.max(currentMin + 1, gXP + 1); // évite division par 0
+    const done = Math.max(0, gXP - currentMin);
+    const span = Math.max(1, target - currentMin);
+    const xpToNext = 0;
+    return { current, next, done, span, xpToNext };
+  }
+
+  // Cas 3 : entre deux paliers
+  const current = ladder[nextIndex - 1];
+  const next = ladder[nextIndex];
+  const currentMin = current.xp;
+  const target = next.xp;
+  const done = Math.max(0, gXP - currentMin);
+  const span = Math.max(1, target - currentMin);
+  const xpToNext = Math.max(0, target - gXP);
+  return { current, next, done, span, xpToNext };
+}
+
+/* --------------------------------------- */
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const userId = interaction.user.id;
 
-  // ------- Or -------
-  const goldRow = sql.getGold?.get?.(userId) as { gold?: number } | undefined;
-  const gold = goldRow?.gold ?? 0;
+  // base
+  const user = sql.getUser.get(userId) as { gold?: number } | undefined;
+  const gold = user?.gold ?? 0;
 
-  // ------- XP global + niveau -------
-  const totalXPRow = (sql.totalXPAll?.get?.(userId) as { xp?: number } | undefined);
+  const totalXPRow = sql.totalXPAll.get(userId) as { xp?: number } | undefined;
   const xpGlobal = totalXPRow?.xp ?? 0;
 
-  // levelFromXP peut renvoyer un nombre OU un objet { level, into, toNext, pct }
-  const lvlAny = levelFromXP(xpGlobal) as any;
-  const levelNumber: number = typeof lvlAny === 'number' ? lvlAny : (lvlAny.level ?? 0);
-  const into: number =
-    typeof lvlAny === 'number'
-      ? (xpGlobal % (100 + 50 * levelNumber))
-      : (lvlAny.into ?? 0);
-  const toNext: number =
-    typeof lvlAny === 'number'
-      ? Math.max(1, 100 + 50 * levelNumber)
-      : Math.max(1, lvlAny.toNext ?? (100 + 50 * levelNumber));
+  // niveau global + barre
+  const gl = levelFromXP(xpGlobal); // { level, into, toNext, pct }
+  const barGlobal = makeBar(gl.into, Math.max(1, gl.toNext), 22);
+  const pctGlobal = pct(gl.into, Math.max(1, gl.toNext));
 
-  // progressBar(current, max)
-  const barGlobal = progressBar(into, toNext);
-
-  // ------- Guilde actuelle + XP par guilde -------
+  // guilde actuelle
   const member = interaction.inGuild() ? interaction.guild!.members.cache.get(userId) : null;
   const currentHouse = member ? houses.find(h => member.roles.cache.has(h.roleId)) ?? null : null;
   const guildName = (currentHouse?.name as GuildName | undefined) ?? undefined;
+  const theme = themeByRoleId(currentHouse?.roleId ?? undefined);
 
-  const xpByGuildRows =
-    (sql.xpByGuildAllTime?.all?.(userId) as Array<{ house_role_id: string | null; xp: number }>) ?? [];
+  // XP par guilde (all-time)
+  const rows = (sql.xpByHouseAll.all(userId) as Array<{ house: string | null; xp: number }>) ?? [];
   const xpByGuildMap = new Map<GuildName, number>();
-  xpByGuildRows.forEach(r => {
-    const gname = houses.find(h => h.roleId === r.house_role_id)?.name as GuildName | undefined;
+  rows.forEach(r => {
+    const gname = houses.find(h => h.roleId === r.house)?.name as GuildName | undefined;
     if (gname) xpByGuildMap.set(gname, r.xp);
   });
 
-  // Bloc guilde actuelle
+  // bloc guilde
   let guildField: APIEmbedField = { name: 'Guilde', value: 'Aucune', inline: false };
   if (guildName) {
     const gXP = xpByGuildMap.get(guildName) ?? 0;
-    const { current, next, xpToNext } = titleForGuildXP(guildName, gXP);
-    const span = next ? next.xp - (current?.xp ?? 0) : Math.max(1, gXP - (current?.xp ?? 0));
-    const done = gXP - (current?.xp ?? 0);
-    const barGuild = progressBar(done, span);
+
+    // 🔧 calcule proprement le palier courant / suivant
+    const { current, next, done, span, xpToNext } = computeGuildProgress(guildName, gXP);
+
+    const barGuild = makeBar(done, span, 22);
+    const pctGuild = pct(done, span);
 
     guildField = {
       name: `Guilde actuelle — ${guildName} (${current?.name ?? '—'})`,
       value: [
         `XP: **${fmt(gXP)}**` +
-          (next
-            ? ` • Prochain titre: **${next.name}** dans **${fmt(xpToNext)}** XP`
-            : ' • (Titre maximal atteint)'),
-        `Progression: ${barGuild}`,
+          (next ? ` • Prochain titre: **${next.name}** dans **${fmt(xpToNext)}** XP` : ' • (Titre maximal atteint)'),
+        `\`${barGuild}\` **${pctGuild}%**`,
       ].join('\n'),
       inline: false,
     };
   }
 
-  // Autres guildes
-  const otherGuilds: string[] = [];
-  (Array.from(xpByGuildMap.entries()) as Array<[GuildName, number]>)
-    .filter(([g]) => !guildName || g !== guildName)
-    .sort((a, b) => b[1] - a[1])
-    .forEach(([g, xp]) => {
-      const { current } = titleForGuildXP(g, xp);
-      otherGuilds.push(`• **${g}** — ${fmt(xp)} XP (${current?.name ?? '—'})`);
-    });
-  const otherGuildsField =
-    otherGuilds.length ? { name: 'Autres guildes', value: otherGuilds.join('\n'), inline: false } : null;
+  // activité 30 jours
+  const xp30 = (sql.totalXP30d.get(userId) as { xp?: number } | undefined)?.xp ?? 0;
+  const sess30 = (sql.totalSessions30d.get(userId) as { n?: number } | undefined)?.n ?? 0;
 
-  // ------- Activité 30 jours -------
-  const xp30 = (sql.totalXP30d?.get?.(userId) as { xp?: number } | undefined)?.xp ?? 0;
-  const s30row = (sql.totalSessions30d?.get?.(userId) as { n?: number; c?: number } | undefined);
-  const sess30 = s30row?.n ?? s30row?.c ?? 0;
-
-  const topSkills30 =
-    (sql.topSkills30d?.all?.(userId) as Array<{ skill: string; minutes: number }> | undefined) ?? [];
-  const top30Str = topSkills30.length
-    ? topSkills30.map((s, i) => `${i + 1}. ${s.skill} — ${fmt(s.minutes)} min`).join('\n')
+  const top30 = (sql.topSkills30d.all(userId) as Array<{ skill: string; minutes: number }> | undefined) ?? [];
+  const top30Str = top30.length
+    ? top30.map((s, i) => `${i + 1}. ${s.skill} — ${fmt(s.minutes)} min`).join('\n')
     : '—';
 
-  // ------- Compétences all-time -------
-  const topSkillsAll =
-    (sql.topSkillsAllTime?.all?.(userId) as Array<{ skill: string; minutes: number }> | undefined) ?? [];
-  const topAllStr = topSkillsAll.length
-    ? topSkillsAll
-        .slice(0, 5)
-        .map((s, i) => `${i + 1}. ${s.skill} — ${fmt(s.minutes)} min`)
-        .join('\n') + (topSkillsAll.length > 5 ? `\n(+${topSkillsAll.length - 5} autres)` : '')
+  // compétences all-time
+  const topAll = (sql.topSkillsAllTime.all(userId) as Array<{ skill: string; minutes: number }> | undefined) ?? [];
+  const topAllStr = topAll.length
+    ? topAll.slice(0, 5).map((s, i) => `${i + 1}. ${s.skill} — ${fmt(s.minutes)} min`).join('\n') +
+      (topAll.length > 5 ? `\n(+${topAll.length - 5} autres)` : '')
     : '—';
 
-  // ------- Collections + bonus -------
+  // collections + bonus
   const coll = collectionProgress(userId);
   const byGuild = new Map<string, string[]>();
   coll.forEach(c => {
@@ -123,39 +173,34 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     arr.push(tag);
     byGuild.set(c.guild, arr);
   });
-  const collLines =
-    Array.from(byGuild.entries())
-      .map(([g, parts]) => `• **${g}** — ${parts.join(' • ')}`)
-      .join('\n') || '—';
+  const collLines = Array.from(byGuild.entries()).map(([g, parts]) => `• **${g}** — ${parts.join(' • ')}`).join('\n') || '—';
 
   const { xpMult, goldMult } = collectionBonuses(userId);
-  const bonusLine =
-    xpMult > 1 || goldMult > 1
-      ? `**Bonus actifs :** ${xpMult > 1 ? `XP x${xpMult.toFixed(2)}` : ''}${
-          xpMult > 1 && goldMult > 1 ? ' • ' : ''
-        }${goldMult > 1 ? `Or x${goldMult.toFixed(2)}` : ''}`
-      : 'Aucun bonus de collection actif';
+  const bonusLine = (xpMult > 1 || goldMult > 1)
+    ? `**Bonus actifs :** ${xpMult > 1 ? `XP x${(xpMult).toFixed(2)}` : ''}${(xpMult > 1 && goldMult > 1) ? ' • ' : ''}${goldMult > 1 ? `Or x${(goldMult).toFixed(2)}` : ''}`
+    : 'Aucun bonus de collection actif';
 
-  // ------- Embed -------
-  const fields: APIEmbedField[] = [
-    { name: 'Niveau global', value: `**${levelNumber}**`, inline: true },
-    { name: 'XP total', value: `**${fmt(xpGlobal)}**`, inline: true },
-    { name: 'Or', value: `**${fmt(gold)}** 🪙`, inline: true },
-    { name: 'Vers niveau suivant', value: `${fmt(into)} / ${fmt(toNext)} XP`, inline: false },
-    { name: 'Progression', value: `${barGlobal}`, inline: false },
-    guildField,
-    { name: 'Activité (30 jours)', value: `XP: **${fmt(xp30)}** • Sessions: **${fmt(sess30)}**`, inline: false },
-    { name: 'Top compétences (30 jours)', value: top30Str, inline: false },
-    { name: 'Compétences (tout le temps)', value: topAllStr, inline: false },
-    { name: 'Collections', value: collLines, inline: false },
-    { name: 'Bonus de collections', value: bonusLine, inline: false },
-  ];
-  if (otherGuildsField) fields.splice(6, 0, otherGuildsField);
-
+  // embed
   const embed = new EmbedBuilder()
     .setTitle(`Profil de ${interaction.user.username}`)
-    .addFields(fields)
-    .setColor(0x263238);
+    .setColor(theme.color)
+    .setImage(theme.bannerUrl ?? (null as any))
+    .addFields(
+      { name: 'Niveau global', value: `**${gl.level}**`, inline: true },
+      { name: 'XP total', value: `**${fmt(xpGlobal)}**`, inline: true },
+      { name: 'Or', value: `**${fmt(gold)}** 🪙`, inline: true },
+      {
+        name: 'Progression niveau',
+        value: `\`${makeBar(gl.into, Math.max(1, gl.toNext), 22)}\` **${pctGlobal}%** — ${fmt(gl.into)} / ${fmt(gl.toNext)} XP`,
+        inline: false,
+      },
+      guildField,
+      { name: 'Activité (30 jours)', value: `XP: **${fmt(xp30)}** • Sessions: **${fmt(sess30)}**`, inline: false },
+      { name: 'Top compétences (30 jours)', value: top30Str, inline: false },
+      { name: 'Compétences (tout le temps)', value: topAllStr, inline: false },
+      { name: 'Collections', value: collLines, inline: false },
+      { name: 'Bonus de collections', value: bonusLine, inline: false },
+    );
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }

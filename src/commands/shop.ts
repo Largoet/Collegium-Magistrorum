@@ -1,106 +1,187 @@
 // src/commands/shop.ts
 import {
-  SlashCommandBuilder, ChatInputCommandInteraction,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  MessageFlags, // 👈 utiliser flags pour l'éphémère
+  type ComponentEmojiResolvable,
+  type InteractionReplyOptions,
+  type RepliableInteraction,
 } from 'discord.js';
-import { sql, todayUTC } from '../lib/db';
+import { sql } from '../lib/db';
 import { houses } from '../lib/houses';
-import { guildNameFromRoleId, RARITY_ORDER, RARITY_PRICE, listItems } from '../lib/loot';
+import { themeByRoleId } from '../lib/theme';
+import {
+  RARITY_ORDER,
+  RARITY_PRICE,
+  RARITY_BADGE,
+  listItems,
+  GuildName,
+  describeItem,
+} from '../lib/loot';
 
 export const data = new SlashCommandBuilder()
   .setName('shop')
-  .setDescription('Ta boutique du jour (objets de ta guilde)');
+  .setDescription('Affiche la boutique du jour')
+  .addBooleanOption((opt) =>
+    opt
+      .setName('menu')
+      .setDescription('Afficher sous forme de menu déroulant (au lieu de boutons)')
+  )
+  .addBooleanOption((opt) =>
+    opt
+      .setName('public')
+      .setDescription('Publier publiquement dans le canal (par défaut : éphémère)')
+  );
 
-function pick<T>(arr: T[]): T { return arr[Math.floor(Math.random()*arr.length)]; }
+type Offer = {
+  id: number;
+  item_key: string;
+  rarity: string;
+  price: number;
+  purchased_ts: number | null;
+};
 
-function userGuild(interaction: ChatInputCommandInteraction) {
-  if (!interaction.inGuild()) return { houseRoleId: null as string|null, guild: null as any };
-  const member = interaction.guild!.members.cache.get(interaction.user.id);
-  const h = houses.find(x => member?.roles.cache.has(x.roleId));
-  return { houseRoleId: h?.roleId ?? null, guild: guildNameFromRoleId(h?.roleId) };
+function epochDay(now = Date.now()): number {
+  return Math.floor(now / 86400000); // 24h en ms
 }
 
-function has(userId: string, key: string) {
-  const row = sql.hasLoot.get(userId, key) as any;
-  return !!row;
-}
-function missingFor(userId: string, guild: any, rarity: any) {
-  const all = listItems(guild, rarity);
-  return all.filter(it => !has(userId, it.key));
+function guildNameFromRoleId(roleId?: string | null): GuildName | null {
+  if (!roleId) return null;
+  const h = houses.find((x) => x.roleId === roleId);
+  return (h?.name ?? null) as GuildName | null;
 }
 
-function ensureOffers(userId: string, houseRoleId: string|null) {
-  const day = todayUTC();
-  let offers = sql.getOffersForUserToday.all(userId, day) as any[];
-  if (offers.length) return offers;
+/** Génère 3 offres (common/rare/epic) si aucune n’existe encore,
+ *  puis injecte "xp_potion_daily" (50🪙) si absente.
+ */
+function ensureOffers(userId: string, day: number, houseRoleId: string | null, guild: GuildName) {
+  let offers = (sql.getOffersForUserToday.all(userId, day) as Offer[]) ?? [];
 
-  const guild = guildNameFromRoleId(houseRoleId);
-  if (!guild) return [];
-
-  // 3 offres : [common, rare, (common|epic)] en priorité sur ce qu'il manque
-  const plan: Array<'common'|'rare'|'epic'|'legendary'|'unique'> = ['common','rare', Math.random()<0.5 ? 'common':'epic'];
-
-  for (let i = 0; i < plan.length; i++) {
-    let rar = plan[i];
-    let pool = missingFor(userId, guild, rar);
-    if (!pool.length) {
-      // fallback: la plus proche rareté avec manque
-      const idx = RARITY_ORDER.indexOf(rar);
-      const around = [...RARITY_ORDER.slice(0, idx).reverse(), ...RARITY_ORDER.slice(idx+1)];
-      for (const r2 of around) {
-        pool = missingFor(userId, guild, r2);
-        if (pool.length) { rar = r2; break; }
-      }
+  if (!offers.length) {
+    const targetRarities: Array<'common' | 'rare' | 'epic'> = ['common', 'rare', 'epic'];
+    for (const rar of targetRarities) {
+      const pool = listItems(guild, rar);
+      if (!pool.length) continue;
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      const price = RARITY_PRICE[rar];
+      sql.insertOffer.run(userId, day, houseRoleId, pick.key, rar, price);
     }
-    plan[i] = rar;
+    offers = (sql.getOffersForUserToday.all(userId, day) as Offer[]) ?? [];
   }
 
-  const picked = new Set<string>();
-  for (const rar of plan) {
-    const pool = listItems(guild, rar).filter(it => !picked.has(it.key) && !has(userId, it.key));
-    if (!pool.length) continue;
-    const it = pick(pool);
-    picked.add(it.key);
-    const price = RARITY_PRICE[rar];
-    sql.insertOffer.run(userId, day, houseRoleId, it.key, rar, price);
+  // Potion XP quotidienne
+  const hasPotion = offers.some((o) => o.item_key === 'xp_potion_daily');
+  if (!hasPotion) {
+    sql.insertOffer.run(userId, day, houseRoleId, 'xp_potion_daily', 'common', 50);
+    offers = (sql.getOffersForUserToday.all(userId, day) as Offer[]) ?? [];
   }
 
-  offers = sql.getOffersForUserToday.all(userId, day) as any[];
   return offers;
 }
 
-export async function execute(interaction: ChatInputCommandInteraction) {
-  const { houseRoleId, guild } = userGuild(interaction);
-  if (!guild) {
-    return interaction.reply({ content: 'Tu dois appartenir à une guilde pour accéder à la boutique.', flags: MessageFlags.Ephemeral });
+// Helper: merge flags éphémère si besoin
+const withEphemeral = (isEphemeral: boolean, opts: InteractionReplyOptions = {}): InteractionReplyOptions =>
+  isEphemeral ? { ...opts, flags: MessageFlags.Ephemeral } : opts;
+
+// Helper sûr pour répondre même si l’interaction est déjà replied/deferred
+async function send(interaction: RepliableInteraction, opts: InteractionReplyOptions) {
+  if (interaction.replied || interaction.deferred) {
+    return interaction.followUp(opts);
+  }
+  return interaction.reply(opts);
+}
+
+// NOTE: on accepte ici *toute* interaction répliable (slash, bouton, etc.)
+export async function execute(interaction: ChatInputCommandInteraction | RepliableInteraction) {
+  const isSlash = 'isChatInputCommand' in interaction && interaction.isChatInputCommand();
+  const userId = interaction.user.id;
+
+  // Options seulement si slash; sinon valeurs par défaut
+  const useMenu = isSlash ? (interaction as ChatInputCommandInteraction).options.getBoolean('menu') ?? false : false;
+  const isPublic = isSlash ? (interaction as ChatInputCommandInteraction).options.getBoolean('public') ?? false : false;
+
+  // guilde actuelle
+  const inGuild = 'inGuild' in interaction ? interaction.inGuild() : false;
+  const member = inGuild && interaction.guild ? interaction.guild.members.cache.get(userId) : null;
+  const houseRoleId = member ? houses.find((h) => member.roles.cache.has(h.roleId))?.roleId ?? null : null;
+  const guild = guildNameFromRoleId(houseRoleId) ?? 'Mage';
+  const theme = themeByRoleId(houseRoleId ?? undefined);
+
+  const day = epochDay();
+
+  // génère si besoin + lit
+  const offers = ensureOffers(userId, day, houseRoleId, guild) as Offer[];
+  if (!offers || !offers.length) {
+    return send(interaction, withEphemeral(!isPublic, { content: 'Boutique vide pour aujourd’hui.' }));
   }
 
-  const offers = ensureOffers(interaction.user.id, houseRoleId);
-  if (!offers.length) {
-    return interaction.reply({ content: 'Aucune offre aujourd’hui (ta collection est peut-être complète).', flags: MessageFlags.Ephemeral });
-  }
+  // couleur (visuel)
+  const rarityIndex = (r: string) => Math.max(0, RARITY_ORDER.indexOf(r as any));
+  const best = offers.reduce((a, b) => (rarityIndex(a.rarity) >= rarityIndex(b.rarity) ? a : b));
+  const color = theme.color;
 
-  const goldRow = sql.getGold.get(interaction.user.id) as { gold: number };
-  const gold = goldRow?.gold ?? 0;
-
-  const lines: string[] = [];
-  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
-  for (const off of offers) {
-    const label = off.purchased ? 'Déjà acheté' : `Acheter — ${off.price} 🪙`;
-    const b = new ButtonBuilder()
-      .setCustomId(`shop:buy:${off.id}`)
-      .setLabel(label)
-      .setStyle(off.purchased ? ButtonStyle.Secondary : ButtonStyle.Primary)
-      .setDisabled(!!off.purchased);
-    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(b));
-    lines.push(`• **${off.item_key}** (${off.rarity}) — ${off.price} 🪙 ${off.purchased ? '— déjà acheté' : ''}`);
-  }
+  // lignes lisibles (nom FR + emoji + prix)
+  const lines = offers.map((o) => {
+    const badge = (RARITY_BADGE as any)?.[o.rarity] ?? '◆';
+    const { name, emoji } = describeItem(o.item_key);
+    const bought = o.purchased_ts ? ' — **(acheté)**' : '';
+    return `${badge} ${emoji ?? ''} **${name}** — **${o.price}** 🪙${bought}`;
+  });
 
   const embed = new EmbedBuilder()
-    .setTitle(`Boutique — ${guild}`)
+    .setTitle(`🏪 Boutique — ${guild}`)
     .setDescription(lines.join('\n'))
-    .setFooter({ text: `Or: ${gold} 🪙 • Offres du jour (personnelles)` })
-    .setColor(0x6a1b9a);
+    .setColor(color)
+    .setImage((theme.bannerUrl ?? '') as any);
 
-  await interaction.reply({ embeds: [embed], components: rows.slice(0,5), flags: MessageFlags.Ephemeral });
+  // purge des vieilles offres
+  sql.cleanupOldOffers.run(day - 14);
+
+  // --- Composants (boutons OU menu) ---
+  const components: Array<
+    ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>
+  > = [];
+
+  if (!useMenu) {
+    // Version BOUTONS
+    const trim = (s: string, n = 22) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      ...offers.map((o) => {
+        const { name, emoji } = describeItem(o.item_key);
+        const label = `${emoji ?? ''} ${trim(name)} — ${o.price}🪙`;
+        return new ButtonBuilder()
+          .setCustomId(`shop:buy:${o.id}`)
+          .setLabel(o.purchased_ts ? 'Acheté' : label)
+          .setStyle(o.purchased_ts ? ButtonStyle.Secondary : ButtonStyle.Primary)
+          .setDisabled(!!o.purchased_ts);
+      })
+    );
+    components.push(row);
+  } else {
+    // Version MENU (achat immédiat à la sélection)
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('shop:buy-select')
+      .setPlaceholder('Choisis un objet à acheter')
+      .addOptions(
+        ...offers.map((o) => {
+          const { name, emoji } = describeItem(o.item_key);
+          const opt = new StringSelectMenuOptionBuilder()
+            .setLabel(name.slice(0, 100))
+            .setDescription(`${o.rarity} — ${o.price}🪙`)
+            .setValue(String(o.id));
+          if (emoji) opt.setEmoji(emoji as ComponentEmojiResolvable);
+          return opt;
+        })
+      );
+    components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select));
+  }
+
+  // réponse (public si isPublic = true, sinon éphémère via flags)
+  return send(interaction, withEphemeral(!isPublic, { embeds: [embed], components }));
 }

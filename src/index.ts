@@ -32,13 +32,14 @@ import {
   handleFocusInterrupt,
   handleDailyButton,
   handleProfileOpen,
+  handleProfileCard,
   handleLeaderboardRefresh,
   handleShopOpen,
   handleShopBuy,
 } from './handlers/panelHandlers';
 
 import { houses } from './lib/houses';
-import './lib/db';
+import './lib/db'; // init DB
 
 // Client avec GuildMembers (pour onboarding/roles)
 const client = new Client({
@@ -92,7 +93,7 @@ function buildHousePanel(guildId: string) {
       .setPlaceholder('Sélectionne ta guilde…')
       .setDisabled(houses.length === 0)
       .addOptions(
-        ...houses.map(h => {
+        ...houses.map((h: any) => {
           const opt = new StringSelectMenuOptionBuilder().setLabel(h.name).setValue(h.roleId);
           if (h.emoji) opt.setEmoji(h.emoji as any);
           return opt;
@@ -108,7 +109,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     if (!houses.length) return;
     const { embed, row } = buildHousePanel(member.guild.id);
 
-    // 1) Essai en DM
+    // 1) DM si possible
     try {
       await member.send({ embeds: [embed], components: [row] });
       return;
@@ -147,14 +148,14 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         const member = await guild.members.fetch(interaction.user.id);
 
         // Retirer autres guildes (une seule guilde active)
-        const houseRoleIds = houses.map(h => h.roleId);
+        const houseRoleIds = houses.map((h: any) => h.roleId);
         const toRemove = member.roles.cache.filter(r => houseRoleIds.includes(r.id) && r.id !== roleId);
         if (toRemove.size) await member.roles.remove([...toRemove.keys()]);
 
         // Ajouter la nouvelle si absente
         if (!member.roles.cache.has(roleId)) await member.roles.add(roleId);
 
-        const roleName = houses.find(h => h.roleId === roleId)?.name ?? 'guilde';
+        const roleName = houses.find((h: any) => h.roleId === roleId)?.name ?? 'guilde';
         const done = new EmbedBuilder()
           .setTitle('🎉 Guilde mise à jour')
           .setDescription(`Tu as rejoint **${roleName}**.\nTes anciennes sessions/XP restent attribuées à tes anciens choix.`)
@@ -186,6 +187,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
 
       // Profile
       if (id === 'panel:profile:open') return handleProfileOpen(interaction as any);
+      if (id === 'panel:profile:card') return handleProfileCard(interaction as any);
 
       // Leaderboard
       if (id === 'panel:leaderboard:refresh') return handleLeaderboardRefresh(interaction as any);
