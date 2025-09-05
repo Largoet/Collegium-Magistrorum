@@ -10,17 +10,16 @@ import { houses } from '../lib/houses';
 import { houseNameFromRoleId } from '../lib/rp';
 import { rollLootForUser } from '../lib/loot';
 
-const CLAIM_COOLDOWN_SEC = 20 * 60 * 60; // 20h
-
 export const data = new SlashCommandBuilder()
   .setName('daily')
-  .setDescription('Réclamer ta récompense quotidienne');
+  .setDescription('Réclame ta récompense quotidienne');
+
+const CLAIM_COOLDOWN_SEC = 20 * 60 * 60; // 20h
 
 export async function execute(interaction: ChatInputCommandInteraction) {
   const userId = interaction.user.id;
   const now = Math.floor(Date.now() / 1000);
 
-  // Streak + cooldown (même logique que le panneau)
   const row = sql.getDaily.get(userId) as { last_claim_ts?: number; streak?: number } | undefined;
   const last = row?.last_claim_ts ?? 0;
   let streak = row?.streak ?? 0;
@@ -36,16 +35,15 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     });
   }
 
-  // Grâce : si >0 et < 48h depuis le dernier claim → streak+1 (cap à 7)
   if (!last || delta < 48 * 3600) streak = Math.min((streak || 0) + 1, 7);
   else streak = 1;
 
-  // Déterminer la guilde actuelle (si en serveur)
+  // guilde
   const member = interaction.inGuild() ? interaction.guild!.members.cache.get(userId) : null;
   const houseRoleId = member ? houses.find(h => member.roles.cache.has(h.roleId))?.roleId ?? null : null;
   const houseName = houseNameFromRoleId(houseRoleId ?? undefined);
 
-  // Récompense
+  // récompenses
   const baseGold = 25;
   const baseXP = 15;
   const bonus = Math.round((streak - 1) * 0.2 * baseXP);
@@ -59,14 +57,12 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   if (houseRoleId) sql.insertXPWithHouse.run(userId, totalXP, at, houseRoleId);
   else sql.insertXP.run(userId, totalXP, at);
 
-  // Loot sans doublons
+  // loot (journalier)
   const drop = rollLootForUser(userId, houseRoleId ?? undefined);
   if (drop) sql.insertLoot.run(userId, drop.key, houseRoleId, drop.rarity, at);
 
-  // Streak update
   sql.upsertDaily.run(userId, now, streak);
 
-  // Embed
   const lootLine = drop ? `\n${drop.emoji ?? '🎁'} Butin: **${drop.name}** (${drop.rarity})` : '';
   const embed = new EmbedBuilder()
     .setTitle(`Récompense quotidienne — ${houseName}`)

@@ -6,10 +6,56 @@ export type Rarity = 'common' | 'rare' | 'epic' | 'legendary' | 'unique';
 export type GuildName = 'Mage' | 'Archer' | 'Guerrier' | 'Voleur';
 export type Item = { key: string; name: string; emoji?: string; rarity: Rarity; guild: GuildName };
 
+// --- Réglages généraux ---
 export const RARITY_ORDER: Rarity[] = ['common','rare','epic','legendary','unique'];
-export const RARITY_PRICE: Record<Rarity, number> = { common: 50, rare: 150, epic: 500, legendary: 1400, unique: 5000 };
-const RARITY_PROB: Record<Rarity, number> = { common: 0.65, rare: 0.25, epic: 0.08, legendary: 0.02, unique: 0.005 };
+export const RARITY_PRICE: Record<Rarity, number> = {
+  common: 50, rare: 150, epic: 500, legendary: 1400, unique: 5000
+};
 
+// Badges (pour UI)
+export const RARITY_BADGE: Record<Rarity, string> = {
+  common: '✅',      // commun
+  rare: '🔷',        // rare
+  epic: '🔶',        // épique
+  legendary: '✴️',   // légendaire
+  unique: '🟨',      // unique
+};
+
+// Couleurs (hex) pour styling embeds
+export const RARITY_COLOR: Record<Rarity, number> = {
+  common: 0x9e9e9e,      // gris
+  rare: 0x42a5f5,        // bleu
+  epic: 0xffa726,        // orange
+  legendary: 0xffd54f,   // or clair
+  unique: 0xfff176,      // jaune
+};
+
+// Pondération des raretés quand un drop a lieu (somme ~ 1.005 ; pickRarity est robuste)
+const RARITY_PROB: Record<Rarity, number> = {
+  common: 0.65, rare: 0.25, epic: 0.08, legendary: 0.02, unique: 0.005
+};
+
+// --- Chances de drop par source ---
+// Daily : chance fixe
+const DAILY_DROP_CHANCE = 0.30;
+
+// Focus : échelle par durée (≥25 min obligatoire)
+const FOCUS_DROP_STEPS: Array<{ min: number; chance: number }> = [
+  { min: 120, chance: 0.65 },
+  { min: 90,  chance: 0.55 },
+  { min: 60,  chance: 0.45 },
+  { min: 45,  chance: 0.30 },
+  { min: 25,  chance: 0.20 },
+];
+function focusDropChance(minutes: number): number {
+  if (!Number.isFinite(minutes) || minutes < 25) return 0;
+  for (const step of FOCUS_DROP_STEPS) {
+    if (minutes >= step.min) return step.chance;
+  }
+  return 0;
+}
+
+// --- Utilitaires ---
 function it(g: GuildName, r: Rarity, key: string, name: string, emoji?: string): Item {
   return { guild: g, rarity: r, key, name, emoji };
 }
@@ -134,16 +180,44 @@ function missing(userId: string, g: GuildName, r: Rarity): Item[] {
   return listItems(g, r).filter(it => !hasItem(userId, it.key));
 }
 
+// --- Tirage de rareté robuste (indépendant de la somme des poids) ---
 function pickRarity(): Rarity {
-  const r = Math.random(); let acc = 0;
-  for (const rar of RARITY_ORDER) { acc += RARITY_PROB[rar]; if (r <= acc) return rar; }
+  const total = RARITY_ORDER.reduce((s, rar) => s + (RARITY_PROB[rar] ?? 0), 0);
+  let r = Math.random() * (total > 0 ? total : 1);
+  for (const rar of RARITY_ORDER) {
+    r -= (RARITY_PROB[rar] ?? 0);
+    if (r <= 0) return rar;
+  }
   return 'common';
 }
 
-/** Loot non dupliqué pour l’utilisateur (descend de rareté si complet) */
-export function rollLootForUser(userId: string, houseRoleId?: string | null) {
+// --- API de loot ---
+export type RollContext =
+  | { source: 'focus'; minutes: number }
+  | { source: 'daily' };
+
+/**
+ * Loot non dupliqué pour l’utilisateur.
+ * - Focus : nécessite ≥25 min, chance croissante avec la durée.
+ * - Daily : chance fixe (DAILY_DROP_CHANCE).
+ */
+export function rollLootForUser(
+  userId: string,
+  houseRoleId?: string | null,
+  ctx?: RollContext
+) {
   const g = guildNameFromRoleId(houseRoleId) ?? null;
   if (!g) return null;
+
+  // 1) Admissibilité + tirage
+  let chance = 0;
+  if (ctx?.source === 'focus') chance = focusDropChance(ctx.minutes);
+  else if (ctx?.source === 'daily') chance = DAILY_DROP_CHANCE;
+  else chance = 0;
+
+  if (chance <= 0 || Math.random() >= chance) return null;
+
+  // 2) Sélection d’un item manquant (descend de rareté si pool vide)
   let rar = pickRarity();
   for (let step = 0; step < RARITY_ORDER.length; step++) {
     const pool = missing(userId, g, rar);
@@ -154,9 +228,11 @@ export function rollLootForUser(userId: string, houseRoleId?: string | null) {
   return null;
 }
 
-const BONUS_XP_BY_RARITY: Record<Rarity, number> = { common: 0.01, rare: 0.02, epic: 0.04, legendary: 0.07, unique: 0.10 };
+// --- Bonus de collections ---
+const BONUS_XP_BY_RARITY: Record<Rarity, number> = {
+  common: 0.01, rare: 0.02, epic: 0.04, legendary: 0.07, unique: 0.10
+};
 
-/** Bonus cumulés (XP pour toutes les guildes sauf Voleur → Or) */
 export function collectionBonuses(userId: string) {
   let xpMult = 1, goldMult = 1;
   (['Mage','Archer','Guerrier','Voleur'] as GuildName[]).forEach((g) => {
@@ -186,6 +262,16 @@ export function collectionProgress(userId: string) {
 }
 
 export function describeItem(key: string) {
+  // --- Cas spécial : consommable boutique (pas dans le CATALOG) ---
+  if (key === 'xp_potion_daily') {
+    return {
+      name: 'Potion d’Expérience (+50 XP)',
+      emoji: '🧪',
+      rarity: 'common' as Rarity,
+      guild: 'Mage' as GuildName,
+    };
+  }
+
   for (const g of Object.keys(CATALOG) as GuildName[]) {
     for (const rar of RARITY_ORDER) {
       const it = CATALOG[g][rar].find(x => x.key === key);
