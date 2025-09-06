@@ -265,7 +265,7 @@ export function describeItem(key: string) {
   // --- Cas spécial : consommable boutique (pas dans le CATALOG) ---
   if (key === 'xp_potion_daily') {
     return {
-      name: 'Potion d’Expérience (+50 XP)',
+      name: 'Potion d’Exp (+50 XP)',
       emoji: '🧪',
       rarity: 'common' as Rarity,
       guild: 'Mage' as GuildName,
