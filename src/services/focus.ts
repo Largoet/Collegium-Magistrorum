@@ -1,7 +1,14 @@
 // src/services/focus.ts
 import {
-  ChatInputCommandInteraction, ButtonInteraction, ModalSubmitInteraction,
-  EmbedBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder, ComponentType, MessageFlags,
+  ChatInputCommandInteraction,
+  ButtonInteraction,
+  ModalSubmitInteraction,
+  EmbedBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
+  ComponentType,
+  MessageFlags,
 } from 'discord.js';
 import { commitSession, sql } from '../lib/db';
 import { houses } from '../lib/houses';
@@ -19,9 +26,10 @@ type FocusState = {
   subject: string;
   houseRoleId: string | null;
   messageId?: string;
+  pingMessageId?: string; // ping de fin à supprimer lors de la clôture
 };
 
-const running = new Map<string, FocusState>(); // verrou cross-device par utilisateur
+const running = new Map<string, FocusState>(); // verrou utilisateur (cross-device)
 
 function replyEphemeral(i: any, content: string) {
   const payload = { content, flags: MessageFlags.Ephemeral as number };
@@ -36,6 +44,10 @@ function getUserHouseRoleId(i: FocusInteraction): string | null {
   return h?.roleId ?? null;
 }
 
+export function hasRunning(userId: string) {
+  return running.has(userId);
+}
+
 export async function startFocusSession(
   interaction: FocusInteraction,
   minutes: number,
@@ -44,8 +56,10 @@ export async function startFocusSession(
 ) {
   const userId = interaction.user.id;
 
-  // 🔒 verrou global utilisateur
-  if (running.has(userId)) return replyEphemeral(interaction, '⏳ Tu as déjà une session /focus en cours. Valide ou interrompt-la d’abord.');
+  // 🔒 verrou global
+  if (running.has(userId)) {
+    return replyEphemeral(interaction, '⏳ Tu as déjà une session /focus en cours. Valide ou interrompt-la d’abord.');
+  }
 
   const startedAtSec = Math.floor(Date.now() / 1000);
   const enableAtSec = startedAtSec + minutes * 60;
@@ -54,10 +68,17 @@ export async function startFocusSession(
   const houseName = houseNameFromRoleId(houseRoleId ?? undefined);
   const theme = themeByRoleId(houseRoleId ?? undefined);
 
-  const state: FocusState = { startedAtSec, enableAtSec, minutes, skill: skill.trim(), subject: subject.trim(), houseRoleId };
+  const state: FocusState = {
+    startedAtSec,
+    enableAtSec,
+    minutes,
+    skill: skill.trim(),
+    subject: subject.trim(),
+    houseRoleId,
+  };
   running.set(userId, state);
 
-  // petit OK éphémère
+  // Petit OK éphémère
   await replyEphemeral(interaction, `✅ Ta séance de ${minutes} min est lancée.`);
 
   const endInlineTs = `<t:${enableAtSec}:t>`;
@@ -78,7 +99,7 @@ export async function startFocusSession(
   const sessionMsg = await chan.send({ embeds: [baseEmbed], components: [row] });
   state.messageId = sessionMsg.id;
 
-  // ⏳ signaux T-5 et T-1
+  // ⏳ signaux T-5 et T-1 (si pertinents)
   const msTo = (sec: number) => Math.max(0, sec * 1000 - Date.now());
   const tint = async (hex: number, note: string) => {
     const e2 = EmbedBuilder.from(baseEmbed)
@@ -87,20 +108,40 @@ export async function startFocusSession(
     try { await sessionMsg.edit({ embeds: [e2] }); } catch {}
   };
   if (minutes >= 10) setTimeout(() => tint(0xff9800, '⏳ **5 minutes restantes…**'), msTo(enableAtSec - 5 * 60));
-  if (minutes >= 2)  setTimeout(() => tint(0xe53935, '⏳ **1 minute restante…**'), msTo(enableAtSec - 60));
+  if (minutes >= 2)  setTimeout(() => tint(0xe53935, '⏳ **1 minute restante…**'),   msTo(enableAtSec - 60));
 
-  // 🎛️ boutons (seul le lanceur)
+  // 🎛️ collector SANS limite de temps (reste actif jusqu’à suppression de la carte)
   const collector = sessionMsg.createMessageComponentCollector({
     componentType: ComponentType.Button,
-    time: minutes * 60 * 1000 + 10 * 60 * 1000,
-    filter: (btn: any) => btn.user.id === userId &&
+    filter: (btn: any) =>
+      btn.user.id === userId &&
       (btn.customId === 'slash:focus:validate' || btn.customId === 'slash:focus:interrupt'),
   });
+
+  async function cleanupAfterClose(kind: 'validated' | 'aborted') {
+    // supprime la carte
+    try { await sessionMsg.delete(); } catch {}
+    // supprime le ping de fin, s'il existe
+    try {
+      if (state.pingMessageId) {
+        const pingMsg = await chan.messages.fetch(state.pingMessageId).catch(() => null);
+        if (pingMsg) await pingMsg.delete().catch(() => {});
+      }
+    } catch {}
+    // DM + petit toast
+    try {
+      await (interaction as any).user.send(kind === 'validated' ? '✅ Séance validée. Bien joué !' : '⏹️ Séance interrompue.');
+    } catch {}
+    try {
+      const toast = await chan.send(`${(interaction as any).user} ${kind === 'validated' ? '✅ séance validée.' : '⏹️ séance interrompue.'}`);
+      setTimeout(() => toast.delete().catch(() => {}), 15000);
+    } catch {}
+  }
 
   collector.on('collect', async (btn: any) => {
     const now = Math.floor(Date.now() / 1000);
 
-    // VALIDER
+    // === Valider ===
     if (btn.customId === 'slash:focus:validate') {
       if (now < state.enableAtSec) {
         const mins = Math.ceil((state.enableAtSec - now) / 60);
@@ -127,18 +168,12 @@ export async function startFocusSession(
         .setColor(0x2e7d32);
 
       running.delete(userId);
-      collector.stop('validated');
       try { await btn.deferUpdate(); } catch {}
-      try { await sessionMsg.delete(); } catch {}
-      try { await (interaction as any).user.send('✅ Séance validée. Bien joué !'); } catch {}
-      try {
-        const toast = await chan.send(`${(interaction as any).user} ✅ séance validée.`);
-        setTimeout(() => toast.delete().catch(() => {}), 15000);
-      } catch {}
+      await cleanupAfterClose('validated');
       return;
     }
 
-    // INTERROMPRE
+    // === Interrompre ===
     if (btn.customId === 'slash:focus:interrupt') {
       const elapsedMin = Math.max(1, Math.round((now - state.startedAtSec) / 60));
       const xp = Math.max(1, Math.floor(elapsedMin * 0.3));
@@ -154,34 +189,27 @@ export async function startFocusSession(
         .setColor(0xc62828);
 
       running.delete(userId);
-      collector.stop('aborted');
       try { await btn.deferUpdate(); } catch {}
-      try { await sessionMsg.delete(); } catch {}
-      try { await (interaction as any).user.send('⏹️ Séance interrompue.'); } catch {}
-      try {
-        const toast = await chan.send(`${(interaction as any).user} ⏹️ séance interrompue.`);
-        setTimeout(() => toast.delete().catch(() => {}), 15000);
-      } catch {}
+      await cleanupAfterClose('aborted');
       return;
     }
   });
 
-  // fin d’heure : on signale, on ne libère pas le verrou tant que pas clique
+  // ⏰ Fin de séance : on notifie mais on ne libère pas (jusqu’à clic)
   setTimeout(async () => {
-    if (running.get(userId) !== state) return;
+    if (running.get(userId) !== state) return; // déjà close
+
     try {
       const finished = EmbedBuilder.from(baseEmbed)
         .setTitle('⏰ Séance terminée — clique **Valider** ou **Interrompre**');
       await sessionMsg.edit({ embeds: [finished], components: [row] });
     } catch {}
+
     try { await (interaction as any).user.send(`⏰ Ta séance de ${minutes} min est terminée. Clique **Valider** dans le salon.`); } catch {}
+
     try {
-      const ping = await chan.send(`${(interaction as any).user} ⏰ fin de séance — pense à **Valider**.`);
-      setTimeout(() => ping.delete().catch(() => {}), 20000);
+      const ping = await chan.send(`${(interaction as any).user} ⏰ fin de séance — clique **Valider** ou **Interrompre**.`);
+      state.pingMessageId = ping.id; // on le supprimera quand la séance sera clôturée
     } catch {}
   }, minutes * 60 * 1000);
-}
-
-export function hasRunning(userId: string) {
-  return running.has(userId);
 }
