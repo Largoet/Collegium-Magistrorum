@@ -118,7 +118,7 @@ export async function startFocusSession(
       (btn.customId === 'slash:focus:validate' || btn.customId === 'slash:focus:interrupt'),
   });
 
-  async function cleanupAfterClose(kind: 'validated' | 'aborted') {
+  async function cleanupAfterClose() {
     // supprime la carte
     try { await sessionMsg.delete(); } catch {}
     // supprime le ping de fin, s'il existe
@@ -127,14 +127,6 @@ export async function startFocusSession(
         const pingMsg = await chan.messages.fetch(state.pingMessageId).catch(() => null);
         if (pingMsg) await pingMsg.delete().catch(() => {});
       }
-    } catch {}
-    // DM + petit toast
-    try {
-      await (interaction as any).user.send(kind === 'validated' ? '✅ Séance validée. Bien joué !' : '⏹️ Séance interrompue.');
-    } catch {}
-    try {
-      const toast = await chan.send(`${(interaction as any).user} ${kind === 'validated' ? '✅ séance validée.' : '⏹️ séance interrompue.'}`);
-      setTimeout(() => toast.delete().catch(() => {}), 15000);
     } catch {}
   }
 
@@ -169,7 +161,19 @@ export async function startFocusSession(
 
       running.delete(userId);
       try { await btn.deferUpdate(); } catch {}
-      await cleanupAfterClose('validated');
+
+      // 📨 Résultat complet à l’utilisateur
+      try { await btn.followUp({ embeds: [doneEmbed], flags: MessageFlags.Ephemeral }); } catch {}
+      try { await (interaction as any).user.send({ embeds: [doneEmbed] }); } catch {}
+
+      // 🔔 Toast bref dans le salon (auto-suppression)
+      try {
+        const gains = `+${xp} XP${gold > 0 ? ` • +${gold} 🪙` : ''}${drop ? ` • ${drop.emoji ?? '🎁'} ${drop.name}` : ''}`;
+        const toast = await chan.send(`${(interaction as any).user} ✅ séance validée — ${gains}`);
+        setTimeout(() => toast.delete().catch(() => {}), 15000);
+      } catch {}
+
+      await cleanupAfterClose();
       return;
     }
 
@@ -190,7 +194,18 @@ export async function startFocusSession(
 
       running.delete(userId);
       try { await btn.deferUpdate(); } catch {}
-      await cleanupAfterClose('aborted');
+
+      // 📨 Résultat complet à l’utilisateur
+      try { await btn.followUp({ embeds: [failEmbed], flags: MessageFlags.Ephemeral }); } catch {}
+      try { await (interaction as any).user.send({ embeds: [failEmbed] }); } catch {}
+
+      // 🔔 Toast bref dans le salon (auto-suppression)
+      try {
+        const toast = await chan.send(`${(interaction as any).user} ⏹️ séance interrompue — +${xp} XP`);
+        setTimeout(() => toast.delete().catch(() => {}), 15000);
+      } catch {}
+
+      await cleanupAfterClose();
       return;
     }
   });
