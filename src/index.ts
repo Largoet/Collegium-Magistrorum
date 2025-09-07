@@ -28,8 +28,8 @@ import * as shopPanel from './commands/shop-panel';
 import {
   handleFocusButton,
   handleFocusModal,
-  handleFocusValidate,
-  handleFocusInterrupt,
+  // handleFocusValidate,   // ⬅️ supprimé
+  // handleFocusInterrupt,  // ⬅️ supprimé
   handleDailyButton,
   handleProfileOpen,
   handleProfileCard,
@@ -41,12 +41,10 @@ import {
 import { houses } from './lib/houses';
 import './lib/db'; // init DB
 
-// Client avec GuildMembers (pour onboarding/roles)
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
-// Registre des commandes
 const commands = new Collection<string, any>([
   [ping.data.name, ping],
   [focus.data.name, focus],
@@ -57,7 +55,6 @@ const commands = new Collection<string, any>([
   [leaderboard.data.name, leaderboard],
   [shop.data.name, shop],
   [buy.data.name, buy],
-  // panneaux
   [focusPanel.data.name, focusPanel],
   [dailyPanel.data.name, dailyPanel],
   [profilePanel.data.name, profilePanel],
@@ -76,7 +73,6 @@ client.once(Events.ClientReady, (c) => {
   console.log(`🤖 Logged in as ${c.user.tag}`);
 });
 
-/* -------- Onboarding nouveau membre (DM sinon canal d’accueil) -------- */
 function buildHousePanel(guildId: string) {
   const embed = new EmbedBuilder()
     .setTitle('Bienvenue !')
@@ -109,15 +105,11 @@ client.on(Events.GuildMemberAdd, async (member) => {
     if (!houses.length) return;
     const { embed, row } = buildHousePanel(member.guild.id);
 
-    // 1) DM si possible
     try {
       await member.send({ embeds: [embed], components: [row] });
       return;
-    } catch {
-      // DM off -> fallback
-    }
+    } catch {}
 
-    // 2) Fallback salon d’accueil, si configuré
     if (env.WELCOME_CHANNEL_ID) {
       const ch = await member.guild.channels.fetch(env.WELCOME_CHANNEL_ID).catch(() => null);
       if (ch && ch.isTextBased()) {
@@ -133,9 +125,13 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
-/* -------- Routage des interactions -------- */
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   try {
+    // 👉 Les boutons de la carte Focus publique sont gérés par le collector du service
+    if (interaction.isButton() && interaction.customId.startsWith('slash:focus:')) {
+      return;
+    }
+
     // 1) Sélection de guilde
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('house:select:')) {
       await interaction.deferUpdate();
@@ -147,12 +143,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         const guild = interaction.guild ?? await client.guilds.fetch(guildId);
         const member = await guild.members.fetch(interaction.user.id);
 
-        // Retirer autres guildes (une seule guilde active)
         const houseRoleIds = houses.map((h: any) => h.roleId);
         const toRemove = member.roles.cache.filter(r => houseRoleIds.includes(r.id) && r.id !== roleId);
         if (toRemove.size) await member.roles.remove([...toRemove.keys()]);
 
-        // Ajouter la nouvelle si absente
         if (!member.roles.cache.has(roleId)) await member.roles.add(roleId);
 
         const roleName = houses.find((h: any) => h.roleId === roleId)?.name ?? 'guilde';
@@ -177,24 +171,22 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // Focus
-      if (id === 'panel:focus:validate') return handleFocusValidate(interaction as any);
-      if (id === 'panel:focus:interrupt') return handleFocusInterrupt(interaction as any);
-      if (id.startsWith('panel:focus:')) return handleFocusButton(interaction as any);
+      // Focus (panel)
+      if (id.startsWith('panel:focus:'))   return handleFocusButton(interaction as any);
 
       // Daily
-      if (id === 'panel:daily:claim') return handleDailyButton(interaction as any);
+      if (id === 'panel:daily:claim')      return handleDailyButton(interaction as any);
 
       // Profile
-      if (id === 'panel:profile:open') return handleProfileOpen(interaction as any);
-      if (id === 'panel:profile:card') return handleProfileCard(interaction as any);
+      if (id === 'panel:profile:open')     return handleProfileOpen(interaction as any);
+      if (id === 'panel:profile:card')     return handleProfileCard(interaction as any);
 
       // Leaderboard
       if (id === 'panel:leaderboard:refresh') return handleLeaderboardRefresh(interaction as any);
 
       // Shop
-      if (id === 'panel:shop:open') return handleShopOpen(interaction as any);
-      if (id.startsWith('shop:buy:')) return handleShopBuy(interaction as any);
+      if (id === 'panel:shop:open')        return handleShopOpen(interaction as any);
+      if (id.startsWith('shop:buy:'))      return handleShopBuy(interaction as any);
 
       return;
     }
