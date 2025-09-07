@@ -57,10 +57,11 @@ export async function handleFocusModal(i: ModalSubmitInteraction) {
   await startFocusSession(i as any, minutes, skill, subject);
 }
 
-/* -------- Daily / Profile / Leaderboard / Shop (inchangés) -------- */
+/* -------- Daily depuis panneau -------- */
 import * as dailyCmd from '../commands/daily';
 export async function handleDailyButton(i: ButtonInteraction) { return (dailyCmd as any).execute(i as any); }
 
+/* -------- Panneaux additionnels -------- */
 import * as profileCmd from '../commands/profile';
 export async function handleProfileOpen(i: ButtonInteraction) { return (profileCmd as any).execute(i as any); }
 

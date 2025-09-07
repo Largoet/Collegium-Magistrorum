@@ -6,7 +6,7 @@ import {
 } from 'discord.js';
 import { env } from './lib/config';
 
-// ---- Commands existants ----
+// ---- Commands
 import * as ping from './commands/ping';
 import * as focus from './commands/focus';
 import * as profile from './commands/profile';
@@ -17,19 +17,17 @@ import * as buy from './commands/buy';
 import * as daily from './commands/daily';
 import * as leaderboard from './commands/leaderboard';
 
-// ---- Nouveaux panneaux ----
+// ---- Panneaux
 import * as focusPanel from './commands/focus-panel';
 import * as dailyPanel from './commands/daily-panel';
 import * as profilePanel from './commands/profile-panel';
 import * as leaderboardPanel from './commands/leaderboard-panel';
 import * as shopPanel from './commands/shop-panel';
 
-// ---- Handlers panneaux ----
+// ---- Handlers panneaux
 import {
   handleFocusButton,
   handleFocusModal,
-  // handleFocusValidate,   // ⬅️ supprimé
-  // handleFocusInterrupt,  // ⬅️ supprimé
   handleDailyButton,
   handleProfileOpen,
   handleProfileCard,
@@ -73,6 +71,7 @@ client.once(Events.ClientReady, (c) => {
   console.log(`🤖 Logged in as ${c.user.tag}`);
 });
 
+/* -------- Onboarding nouveau membre -------- */
 function buildHousePanel(guildId: string) {
   const embed = new EmbedBuilder()
     .setTitle('Bienvenue !')
@@ -113,11 +112,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     if (env.WELCOME_CHANNEL_ID) {
       const ch = await member.guild.channels.fetch(env.WELCOME_CHANNEL_ID).catch(() => null);
       if (ch && ch.isTextBased()) {
-        await ch.send({
-          content: `Bienvenue <@${member.id}> !`,
-          embeds: [embed],
-          components: [row],
-        });
+        await ch.send({ content: `Bienvenue <@${member.id}> !`, embeds: [embed], components: [row] });
       }
     }
   } catch (e) {
@@ -125,11 +120,12 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
+/* -------- Routage des interactions -------- */
 client.on(Events.InteractionCreate, async (interaction: Interaction) => {
   try {
     // 👉 Les boutons de la carte Focus publique sont gérés par le collector du service
     if (interaction.isButton() && interaction.customId.startsWith('slash:focus:')) {
-      return;
+      return; // le collector de services/focus.ts répondra
     }
 
     // 1) Sélection de guilde
@@ -146,7 +142,6 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         const houseRoleIds = houses.map((h: any) => h.roleId);
         const toRemove = member.roles.cache.filter(r => houseRoleIds.includes(r.id) && r.id !== roleId);
         if (toRemove.size) await member.roles.remove([...toRemove.keys()]);
-
         if (!member.roles.cache.has(roleId)) await member.roles.add(roleId);
 
         const roleName = houses.find((h: any) => h.roleId === roleId)?.name ?? 'guilde';
@@ -171,7 +166,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // Focus (panel)
+      // Focus (panneau)
       if (id.startsWith('panel:focus:'))   return handleFocusButton(interaction as any);
 
       // Daily
