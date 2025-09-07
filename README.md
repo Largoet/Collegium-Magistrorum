@@ -66,7 +66,7 @@ Ce projet explore la **gamification saine** :
 - Pas de grind infini ni de compétition toxique.  
 - Progression personnelle et coopération avant tout.  
 - Dopamine liée à de vrais objectifs atteints.  
-- Usage **domestique / pédagogique** (pas de RH, pas de management par le jeu).  
+- Usage **domestique / pédagogique**.  
 
 ---
 
