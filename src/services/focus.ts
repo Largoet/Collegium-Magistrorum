@@ -1,112 +1,293 @@
 // src/services/focus.ts
-import { sql } from '../lib/db';
+import {
+  ChatInputCommandInteraction,
+  ButtonInteraction,
+  ModalSubmitInteraction,
+  EmbedBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
+  ComponentType,
+  MessageFlags,
+} from 'discord.js';
+import { commitSession, sql } from '../lib/db';
+import { houses } from '../lib/houses';
+import { houseNameFromRoleId, introLine, victoryLine, failLine } from '../lib/rp';
 import { rollLootForUser } from '../lib/loot';
+import { themeByRoleId } from '../lib/theme';
 
-/* =========================
-   ÉTAT EN MÉMOIRE (UI)
-   - suit les sessions lancées via panneaux (/handlers)
-   ========================= */
-const activeStarts = new Map<string, number>();
+export type FocusInteraction =
+  | ChatInputCommandInteraction
+  | ButtonInteraction
+  | ModalSubmitInteraction;
 
-/* =========================
-   hasRunning(userId)
-   - utilisé par panelHandlers.ts pour savoir si une session est en cours
-   ========================= */
-export function hasRunning(userId: string): boolean {
-  return activeStarts.has(userId);
+type FocusState = {
+  startedAtSec: number;
+  enableAtSec: number;
+  minutes: number;
+  skill: string;
+  subject: string;
+  houseRoleId: string | null;
+  messageId?: string;
+  pingMessageId?: string;
+};
+
+const running = new Map<string, FocusState>(); // verrou cross-device
+
+function getUserHouseRoleId(i: FocusInteraction): string | null {
+  if (!('inGuild' in i) || !i.inGuild()) return null;
+  const member = i.guild!.members.cache.get(i.user.id);
+  const h = houses.find(hh => member?.roles.cache.has(hh.roleId));
+  return h?.roleId ?? null;
 }
 
-/* =========================
-   startFocusSession(...)
-   Surcharges :
-   1) startFocusSession(interaction, minutes, skill?, subject?)
-      - appelé depuis les panneaux (UI)
-   2) startFocusSession(userId, startedAt, targetMinutes?)
-      - appelé depuis la commande /focus
-   ========================= */
-export function startFocusSession(
-  a: any,
-  b: number,
-  c?: any,
-  d?: any,
-): { userId: string; startedAt: number; targetMinutes: number | null } {
-  // --- Variante 2 : commande (/focus) ---
-  if (typeof a === 'string') {
-    const userId = a as string;
-    const startedAt = b; // epoch seconds
-    const targetMinutes = typeof c === 'number' ? c : null;
+export function hasRunning(userId: string) {
+  return running.has(userId);
+}
 
-    // DB: création de la session
-    sql.insertSession.run(userId, startedAt, targetMinutes);
+export async function startFocusSession(
+  interaction: FocusInteraction,
+  minutes: number,
+  skill = 'Général',
+  subject = ''
+) {
+  const userId = interaction.user.id;
 
-    return { userId, startedAt, targetMinutes };
+  // 🔒 une seule séance par utilisateur
+  if (running.has(userId)) {
+    const payload = {
+      content: '⏳ Tu as déjà une session /focus en cours. Valide ou interrompt-la d’abord.',
+      flags: MessageFlags.Ephemeral as number,
+    };
+    if ((interaction as any).replied || (interaction as any).deferred) {
+      await (interaction as any).followUp?.(payload).catch(() => {});
+    } else {
+      await (interaction as any).reply?.(payload).catch(() => {});
+    }
+    return;
   }
 
-  // --- Variante 1 : UI (panneaux) ---
-  const interaction = a;
-  const minutes = b;
-  const userId: string = interaction.user?.id ?? interaction.member?.user?.id;
-  const startedAt = Math.floor(Date.now() / 1000);
-  const targetMinutes = typeof minutes === 'number' ? minutes : null;
+  const startedAtSec = Math.floor(Date.now() / 1000);
+  const enableAtSec = startedAtSec + minutes * 60;
 
-  // Mémoire UI
-  activeStarts.set(userId, startedAt);
+  const houseRoleId = getUserHouseRoleId(interaction);
+  const houseName = houseNameFromRoleId(houseRoleId ?? undefined);
+  const theme = themeByRoleId(houseRoleId ?? undefined);
 
-  // DB: création de la session
-  sql.insertSession.run(userId, startedAt, targetMinutes);
+  const state: FocusState = {
+    startedAtSec,
+    enableAtSec,
+    minutes,
+    skill: skill.trim(),
+    subject: subject.trim(),
+    houseRoleId,
+  };
+  running.set(userId, state);
 
-  return { userId, startedAt, targetMinutes };
-}
+  // ❌ plus d'éphémère « séance lancée »
 
-/* =========================
-   endFocusSession(userId, houseRoleId, startedAt)
-   - appelé par la commande /focus
-   - crédite or/XP puis tente un loot en fonction de la durée
-   ========================= */
-export function endFocusSession(
-  userId: string,
-  houseRoleId: string | null,
-  startedAt: number, // epoch seconds
-): { gold: number; xp: number; durationMin: number; drop: null | { key: string; name: string; rarity: string; emoji?: string } } {
-  // Nettoie l'état UI si la session venait d'un panneau
-  activeStarts.delete(userId);
+  const endInlineTs = `<t:${enableAtSec}:t>`;
+  const baseEmbed = new EmbedBuilder()
+    .setTitle(`${theme.icon} Focus — ${houseName}`)
+    .setDescription(
+      `${introLine(houseName, minutes, skill)}\n\n**Fin prévue :** ${endInlineTs}`,
+    )
+    .setColor(theme.color)
+    .setTimestamp(new Date(enableAtSec * 1000));
 
-  const now = Math.floor(Date.now() / 1000);
-  const durationMin = Math.max(0, Math.floor((now - startedAt) / 60));
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('slash:focus:validate')
+      .setLabel('Valider')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId('slash:focus:interrupt')
+      .setLabel('Interrompre')
+      .setStyle(ButtonStyle.Danger),
+  );
 
-  // --- Récompenses or / xp (formules simples ; garde les tiennes si besoin) ---
-  const gold = calcGoldFromDuration(durationMin);
-  const xp = calcXPFromDuration(durationMin);
-
-  sql.addGold.run(gold, userId);
-  if (houseRoleId) {
-    sql.insertXPWithHouse.run(userId, xp, now, houseRoleId);
+  // 📮 Carte publique
+  let sessionMsg: any;
+  if ('commandName' in interaction) {
+    sessionMsg = await (interaction as ChatInputCommandInteraction).reply({
+      embeds: [baseEmbed],
+      components: [row],
+      fetchReply: true,
+    } as any);
   } else {
-    sql.insertXP.run(userId, xp, now);
+    const chan: any = (interaction as any).channel;
+    if (!chan || typeof chan.send !== 'function') return;
+    sessionMsg = await chan.send({ embeds: [baseEmbed], components: [row] });
   }
+  state.messageId = sessionMsg.id;
 
-  // --- Tirage de loot Focus (seuils encodés dans loot.ts) ---
-  const drop = rollLootForUser(userId, houseRoleId ?? undefined, {
-    source: 'focus',
-    minutes: durationMin,
+  // ⏳ T-5 / T-1
+  const msTo = (sec: number) => Math.max(0, sec * 1000 - Date.now());
+  const tint = async (hex: number, note: string) => {
+    const e2 = EmbedBuilder.from(baseEmbed)
+      .setColor(hex)
+      .setDescription(
+        `${introLine(houseName, minutes, skill)}\n\n${note}\n**Fin prévue :** ${endInlineTs}`,
+      );
+    try {
+      await sessionMsg.edit({ embeds: [e2] });
+    } catch {}
+  };
+  if (minutes >= 10)
+    setTimeout(
+      () => tint(0xff9800, '⏳ **5 minutes restantes…**'),
+      msTo(enableAtSec - 5 * 60),
+    );
+  if (minutes >= 2)
+    setTimeout(
+      () => tint(0xe53935, '⏳ **1 minute restante…**'),
+      msTo(enableAtSec - 60),
+    );
+
+  // 🎛️ Collector
+  const collector = sessionMsg.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    filter: (btn: any) =>
+      btn.user.id === userId &&
+      (btn.customId === 'slash:focus:validate' ||
+        btn.customId === 'slash:focus:interrupt'),
   });
 
-  if (drop) {
-    sql.insertLoot.run(userId, drop.key, houseRoleId, drop.rarity, now);
+  async function cleanupAfterClose() {
+    try {
+      await sessionMsg.delete();
+    } catch {}
+    try {
+      if (state.pingMessageId) {
+        const pingMsg = await (sessionMsg.channel as any).messages
+          .fetch(state.pingMessageId)
+          .catch(() => null);
+        if (pingMsg) await pingMsg.delete().catch(() => {});
+      }
+    } catch {}
   }
 
-  return { gold, xp, durationMin, drop: drop ?? null };
-}
+  collector.on('collect', async (btn: any) => {
+    const now = Math.floor(Date.now() / 1000);
 
-/* =========================
-   Utilitaires récompenses
-   ========================= */
-function calcGoldFromDuration(min: number): number {
-  if (min <= 0) return 0;
-  return Math.max(1, Math.floor(min / 5));
-}
+    // === Valider ===
+    if (btn.customId === 'slash:focus:validate') {
+      if (now < state.enableAtSec) {
+        const mins = Math.ceil((state.enableAtSec - now) / 60);
+        return btn.reply({
+          content: `🕒 Trop tôt. Il reste **${mins} min**.`,
+          flags: MessageFlags.Ephemeral,
+        });
+      }
 
-function calcXPFromDuration(min: number): number {
-  if (min <= 0) return 0;
-  return Math.max(2, Math.floor((min / 5) * 2));
+      const elapsedMin = Math.max(1, Math.round((now - state.startedAtSec) / 60));
+      const xp = elapsedMin;
+      const gold = Math.floor(elapsedMin / 15); // 💰 1 or / 15 min
+
+      commitSession(
+        userId,
+        state.startedAtSec,
+        elapsedMin,
+        'done',
+        state.skill || null,
+        state.subject || null,
+        state.houseRoleId || null,
+      );
+      const at = now;
+      if (state.houseRoleId)
+        sql.insertXPWithHouse.run(userId, xp, at, state.houseRoleId);
+      else sql.insertXP.run(userId, xp, at);
+      if (gold > 0) sql.addGold.run(gold, userId);
+
+      // ===== Correction loot : passage du contexte {source:'focus', minutes} =====
+      const drop = rollLootForUser(userId, state.houseRoleId ?? undefined, {
+        source: 'focus',
+        minutes: elapsedMin,
+      });
+      if (drop)
+        sql.insertLoot.run(userId, drop.key, state.houseRoleId, drop.rarity, at);
+
+      const lootStr = drop
+        ? `${drop.emoji ?? '🎁'} ${drop.name} (${drop.rarity})`
+        : undefined;
+      const doneEmbed = new EmbedBuilder()
+        .setTitle('Session validée ✅')
+        .setDescription(victoryLine(houseName, elapsedMin, xp, gold, lootStr))
+        .setColor(0x2e7d32);
+
+      running.delete(userId);
+      try {
+        await btn.deferUpdate();
+      } catch {}
+      await cleanupAfterClose();
+
+      try {
+        await (sessionMsg.channel as any).send({
+          content: `${btn.user}`,
+          embeds: [doneEmbed],
+        });
+      } catch {}
+
+      return;
+    }
+
+    // === Interrompre ===
+    if (btn.customId === 'slash:focus:interrupt') {
+      const elapsedMin = Math.max(1, Math.round((now - state.startedAtSec) / 60));
+      const xp = Math.max(1, Math.floor(elapsedMin * 0.3));
+
+      commitSession(
+        userId,
+        state.startedAtSec,
+        elapsedMin,
+        'aborted',
+        state.skill || null,
+        state.subject || null,
+        state.houseRoleId || null,
+      );
+      const at = now;
+      if (state.houseRoleId)
+        sql.insertXPWithHouse.run(userId, xp, at, state.houseRoleId);
+      else sql.insertXP.run(userId, xp, at);
+
+      const failEmbed = new EmbedBuilder()
+        .setTitle('Session interrompue')
+        .setDescription(failLine(houseName, xp))
+        .setColor(0xc62828);
+
+      running.delete(userId);
+      try {
+        await btn.deferUpdate();
+      } catch {}
+      await cleanupAfterClose();
+
+      try {
+        await (sessionMsg.channel as any).send({
+          content: `${btn.user}`,
+          embeds: [failEmbed],
+        });
+      } catch {}
+
+      return;
+    }
+  });
+
+  // ⏰ Fin automatique
+  setTimeout(async () => {
+    if (running.get(userId) !== state) return;
+
+    try {
+      const finished = EmbedBuilder.from(baseEmbed).setTitle(
+        '⏰ Séance terminée — clique **Valider** ou **Interrompre**',
+      );
+      await sessionMsg.edit({ embeds: [finished], components: [row] });
+    } catch {}
+
+    try {
+      const ping = await (sessionMsg.channel as any).send(
+        `${(interaction as any).user} ⏰ fin de séance — clique **Valider** ou **Interrompre**.`,
+      );
+      state.pingMessageId = ping.id;
+    } catch {}
+  }, minutes * 60 * 1000);
 }
