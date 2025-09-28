@@ -63,6 +63,27 @@ Chaque séance est transformée en **quête** avec un cadre clair et des récomp
 
 ---
 
+## 🔧 But technique du projet
+
+Collegium Magistrorum est aussi un **terrain d’expérimentation DevOps**.  
+Il me permet de manipuler et de comprendre des outils et pratiques clés :  
+
+- **Node.js / TypeScript** → développement d’un bot Discord modulaire.  
+- **Bases de données** → gestion des sessions et profils utilisateurs (SQLite → PostgreSQL prévu).  
+- **Git & GitHub** → gestion de version et pipeline CI/CD.  
+- **GitHub Actions** → automatisation du build et du déploiement.  
+- **Docker** → écriture de Dockerfile, création d’images, orchestration avec Docker Compose.  
+- **YAML** → configuration (CI/CD, services, variables d’environnement).  
+- **Serveur Debian (Kinto Cloud)** → hébergement auto-géré, sécurisation et supervision.  
+- **Conteneurisation** → séparation entre build et runtime, gestion des volumes persistants.  
+
+Ce projet agit comme un **mini-laboratoire complet** qui couvre à la fois :  
+- le développement applicatif,  
+- l’automatisation et la mise en production,  
+- et l’administration système.  
+
+---
+
 ## 🚀 Roadmap
 
 - [x] MVP (XP, guildes, boutique, quêtes journalières, panels interactifs).  
